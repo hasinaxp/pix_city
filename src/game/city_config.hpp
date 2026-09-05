@@ -123,8 +123,18 @@ static float dir_to_yaw_along(int dir);
 // measured off the mesh rather than guessed. The light source goes there, not
 // at the base of the post.
 #define LAMP_HEIGHT      4.4f
-#define LAMP_RADIUS     17.0f      // how far one lamp reaches down the street
-#define HEADLIGHT_RANGE 26.0f
+#define LAMP_RADIUS     19.0f      // how far one lamp reaches down the street
+#define HEADLIGHT_RANGE 30.0f
+
+// Punctual lights fall off as inverse square, so their colour is an intensity
+// in candela-like units, not a 0..1 screen colour. At the 5 m from a lamp head
+// down to the pavement under it the falloff has already divided by 25, so a
+// colour near 1 arrives as nothing at all - which is exactly what a street of
+// lamps lighting none of the road looks like. These are the numbers that put
+// roughly a quarter of daylight on the ground directly beneath a lamp.
+#define LAMP_INTENSITY      260.0f
+#define HEADLIGHT_INTENSITY 420.0f
+#define BRAKE_INTENSITY      90.0f
 
 #define TRAFFIC_LIGHT_PERIOD 11.0f   // seconds per full north-south / east-west cycle
 // Fraction of each half cycle held all-red after a green ends. Without it the

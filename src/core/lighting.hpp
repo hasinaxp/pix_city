@@ -98,6 +98,11 @@ struct pix_daylight {
     float  hour;
     float  elevation;   // degrees above the horizon
     float  azimuth;     // degrees, 0 = +X, turning toward +Z
+    // What the camera's aperture does about it. A night street lit by sodium
+    // lamps carries a hundredth of the light a noon street does, and no amount
+    // of adding lamps closes that gap - the eye adapts to it, and so does every
+    // camera, so the exposure is part of the hour rather than a constant.
+    float  exposure;
     pix_sun sun;
     pix_sky sky;
 };
@@ -111,12 +116,12 @@ struct pix_daylight {
 // makes a shaded pavement read as dusk in the middle of the afternoon.
 static const pix_daylight PIX_DAY[PIX_DAY_KEYS] = {
     //           hr   elev   azim   sun colour                sky zenith            horizon              ground             up irradiance       down irradiance    fog                 density
-    { 0.0f,   -18.0f, 300.0f, { {}, { 0.05f, 0.06f, 0.11f } }, { { 0.010f, 0.014f, 0.035f }, { 0.030f, 0.038f, 0.070f }, { 0.006f, 0.006f, 0.010f }, { 0.030f, 0.036f, 0.060f }, { 0.010f, 0.010f, 0.014f }, { 0.05f, 0.06f, 0.10f }, 0.0016f } },
-    { 6.0f,     4.0f,  75.0f, { {}, { 1.45f, 0.72f, 0.42f } }, { { 0.090f, 0.170f, 0.360f }, { 0.560f, 0.430f, 0.360f }, { 0.070f, 0.060f, 0.055f }, { 0.220f, 0.245f, 0.320f }, { 0.095f, 0.085f, 0.070f }, { 0.62f, 0.55f, 0.50f }, 0.0022f } },
-    { 9.0f,    38.0f,  60.0f, { {}, { 2.00f, 1.68f, 1.32f } }, { { 0.130f, 0.310f, 0.620f }, { 0.540f, 0.670f, 0.840f }, { 0.120f, 0.115f, 0.100f }, { 0.360f, 0.450f, 0.610f }, { 0.180f, 0.172f, 0.145f }, { 0.58f, 0.69f, 0.84f }, 0.0012f } },
-    { 13.0f,   66.0f,  30.0f, { {}, { 2.15f, 1.95f, 1.70f } }, { { 0.120f, 0.300f, 0.640f }, { 0.560f, 0.690f, 0.860f }, { 0.140f, 0.135f, 0.115f }, { 0.390f, 0.480f, 0.640f }, { 0.200f, 0.192f, 0.165f }, { 0.60f, 0.71f, 0.86f }, 0.0011f } },
-    { 18.5f,    8.0f, 285.0f, { {}, { 2.10f, 1.10f, 0.58f } }, { { 0.100f, 0.190f, 0.400f }, { 0.780f, 0.510f, 0.340f }, { 0.090f, 0.075f, 0.065f }, { 0.250f, 0.245f, 0.290f }, { 0.120f, 0.100f, 0.080f }, { 0.74f, 0.56f, 0.44f }, 0.0020f } },
-    { 21.0f,  -12.0f, 300.0f, { {}, { 0.16f, 0.16f, 0.26f } }, { { 0.020f, 0.026f, 0.060f }, { 0.070f, 0.070f, 0.110f }, { 0.010f, 0.010f, 0.016f }, { 0.050f, 0.056f, 0.090f }, { 0.018f, 0.018f, 0.024f }, { 0.09f, 0.10f, 0.15f }, 0.0018f } }
+    { 0.0f,   -18.0f, 300.0f, 1.70f, { {}, { 0.05f, 0.06f, 0.11f } }, { { 0.010f, 0.014f, 0.035f }, { 0.030f, 0.038f, 0.070f }, { 0.006f, 0.006f, 0.010f }, { 0.060f, 0.070f, 0.115f }, { 0.026f, 0.026f, 0.034f }, { 0.05f, 0.06f, 0.10f }, 0.0016f } },
+    { 6.0f,     4.0f,  75.0f, 1.30f, { {}, { 1.45f, 0.72f, 0.42f } }, { { 0.090f, 0.170f, 0.360f }, { 0.560f, 0.430f, 0.360f }, { 0.070f, 0.060f, 0.055f }, { 0.220f, 0.245f, 0.320f }, { 0.095f, 0.085f, 0.070f }, { 0.62f, 0.55f, 0.50f }, 0.0022f } },
+    { 9.0f,    38.0f,  60.0f, 0.95f, { {}, { 2.00f, 1.68f, 1.32f } }, { { 0.130f, 0.310f, 0.620f }, { 0.540f, 0.670f, 0.840f }, { 0.120f, 0.115f, 0.100f }, { 0.360f, 0.450f, 0.610f }, { 0.180f, 0.172f, 0.145f }, { 0.58f, 0.69f, 0.84f }, 0.0012f } },
+    { 13.0f,   66.0f,  30.0f, 0.90f, { {}, { 2.15f, 1.95f, 1.70f } }, { { 0.120f, 0.300f, 0.640f }, { 0.560f, 0.690f, 0.860f }, { 0.140f, 0.135f, 0.115f }, { 0.390f, 0.480f, 0.640f }, { 0.200f, 0.192f, 0.165f }, { 0.60f, 0.71f, 0.86f }, 0.0011f } },
+    { 18.5f,    8.0f, 285.0f, 1.10f, { {}, { 2.10f, 1.10f, 0.58f } }, { { 0.100f, 0.190f, 0.400f }, { 0.780f, 0.510f, 0.340f }, { 0.090f, 0.075f, 0.065f }, { 0.250f, 0.245f, 0.290f }, { 0.120f, 0.100f, 0.080f }, { 0.74f, 0.56f, 0.44f }, 0.0020f } },
+    { 21.0f,  -12.0f, 300.0f, 1.60f, { {}, { 0.16f, 0.16f, 0.26f } }, { { 0.020f, 0.026f, 0.060f }, { 0.070f, 0.070f, 0.110f }, { 0.010f, 0.010f, 0.016f }, { 0.085f, 0.095f, 0.145f }, { 0.038f, 0.038f, 0.048f }, { 0.09f, 0.10f, 0.15f }, 0.0018f } }
 };
 
 static vec3 pix__mix3(vec3 a, vec3 b, float t) { return v3lerp(a, b, t); }
@@ -132,7 +137,9 @@ static vec3 pix_sun_direction(float elevation_deg, float azimuth_deg) {
 }
 
 // The complete lighting setup for an hour of the day, 0..24.
-static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky) {
+// `hour` is wrapped, so a caller may wind the clock past either end of a day.
+static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky,
+                            float* out_exposure) {
     hour = fmodf(hour, 24.0f);
     if (hour < 0.0f) hour += 24.0f;
 
@@ -159,6 +166,7 @@ static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky) {
     float elev = A.elevation + (B.elevation - A.elevation) * t;
     out_sun->direction = pix_sun_direction(elev, azim);
     out_sun->color = pix__mix3(A.sun.color, B.sun.color, t);
+    *out_exposure = A.exposure + (B.exposure - A.exposure) * t;
 
     out_sky->zenith       = pix__mix3(A.sky.zenith, B.sky.zenith, t);
     out_sky->horizon      = pix__mix3(A.sky.horizon, B.sky.horizon, t);

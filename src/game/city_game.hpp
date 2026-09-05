@@ -159,23 +159,32 @@ static void city__draw_water(const city_world& w, pix_renderer& renderer,
 // Colours are the ones the real fittings have: sodium street lighting is warm
 // and orange, headlights are a cool white, and having the two disagree is most
 // of what makes a night street read as a night street.
-static void city__submit_lights(const city_game& g, pix_renderer& renderer, vec3 eye) {
+static void city__submit_lights(city_game& g, pix_renderer& renderer, vec3 eye) {
     float night = renderer.night;
+
+    // Lit windows. One material carries every building in the city, so this is
+    // one assignment a frame rather than anything per building - and because it
+    // rides on the same night factor the lamps do, the whole city comes on
+    // together over the same few minutes of dusk.
+    if (g.catalog.mat_building < renderer.material_count)
+        renderer.materials[g.catalog.mat_building].window_glow =
+            v3scale(v3(1.00f, 0.86f, 0.58f), night * 0.85f);
+
     if (night <= 0.01f) return;
 
-    const float reach = 120.0f;
-    vec3 lamp_color = v3(2.60f, 1.55f, 0.62f);
+    const float reach = 140.0f;
+    vec3 lamp_color = v3scale(v3(1.00f, 0.60f, 0.24f), LAMP_INTENSITY * night);
     for (size_t i = 0; i < g.world.lamp_count; i++) {
         vec3 p = g.world.lamps[i];
         float dx = p.x - eye.x, dz = p.z - eye.z;
         if (dx * dx + dz * dz > reach * reach) continue;
-        push_light(renderer, pix_point_light(p, LAMP_RADIUS, v3scale(lamp_color, night)));
+        push_light(renderer, pix_point_light(p, LAMP_RADIUS, lamp_color));
     }
 
     // Headlights. A cone out of the nose of the car, aimed slightly down the
     // road rather than straight ahead, plus a small red bulb at the back so a
     // queue of traffic reads from behind.
-    vec3 beam_color = v3(3.10f, 3.00f, 2.70f);
+    vec3 beam_color = v3scale(v3(1.00f, 0.97f, 0.88f), HEADLIGHT_INTENSITY * night);
     for (size_t i = 0; i < MAX_CARS; i++) {
         const city_car& c = g.traffic.cars[i];
         if (!c.active) continue;
@@ -188,13 +197,13 @@ static void city__submit_lights(const city_game& g, pix_renderer& renderer, vec3
         nose.y += 0.75f;
         vec3 beam = v3norm(v3(fwd.x, -0.22f, fwd.z));
         push_light(renderer, pix_spot_light(nose, beam, HEADLIGHT_RANGE,
-                                            0.30f, 0.62f, v3scale(beam_color, night)));
+                                            0.30f, 0.62f, beam_color));
 
         if (c.brake_light > 0.5f) {
             vec3 tail = v3sub(c.position, v3scale(fwd, vm.half_length));
             tail.y += 0.75f;
-            push_light(renderer, pix_point_light(tail, 5.0f,
-                                                 v3scale(v3(1.60f, 0.12f, 0.06f), night)));
+            push_light(renderer, pix_point_light(tail, 6.0f,
+                v3scale(v3(1.00f, 0.07f, 0.04f), BRAKE_INTENSITY * night)));
         }
     }
 }

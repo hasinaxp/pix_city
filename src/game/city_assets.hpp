@@ -147,6 +147,10 @@ struct city_catalog {
     idx mat_city, mat_suburban, mat_vehicle, mat_rail, mat_palette;
     idx mat_grass, mat_concrete, mat_asphalt, mat_dirt, mat_water, mat_horizon;
     idx mat_riverbed, mat_stone;
+    // The same citybits atlas as the roads and the street furniture, but its
+    // own material: buildings are the only thing whose windows should light up
+    // after dark, and emission is a property of the material, not the mesh.
+    idx mat_building;
     // a few shades of the same green so a field of grass cells is not one flat sheet
     idx mat_grass_shades[CITY_GRASS_SHADES];
     // Same citybits atlas, a few shades apart. Real streets are not built out of
@@ -390,7 +394,7 @@ static void city__add_buildings(city_catalog& cat, pix_data_loader& loader,
 
             city_model& m = cat.models[cat.model_count++];
             m.mesh = mesh;
-            m.material = cat.mat_city;
+            m.material = cat.mat_building;
             m.bounds_min = md.bounds_min;
             m.bounds_max = md.bounds_max;
             m.scale = KIT_ROAD_SCALE;
@@ -844,6 +848,7 @@ static bool city_load_catalog(city_catalog& cat, pix_data_loader& loader, pix_re
         { 1.00f, 1.00f, 1.00f }, { 0.93f, 0.94f, 0.97f },
         { 1.05f, 1.02f, 0.97f }, { 0.88f, 0.89f, 0.90f }
     };
+    cat.mat_building = clone_material(renderer, cat.mat_city, v3(1, 1, 1), 0.0f, 0.62f);
     cat.mat_city_shades[cat.mat_city_shade_count++] = cat.mat_city;
     for (int i = 1; i < 4; i++)
         cat.mat_city_shades[cat.mat_city_shade_count++] =

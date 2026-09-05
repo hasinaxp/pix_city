@@ -39,9 +39,18 @@ struct material {
     float metallic;
     float roughness;
     // Linear radiance the surface gives off by itself. Zero for almost
-    // everything; it is what a lit window, a brake light or a lamp head is,
-    // and it is the channel the bloom pass exists to serve.
+    // everything; it is what a brake light or a lamp head is, and it is the
+    // channel the bloom pass exists to serve.
     vec3 emissive;
+    // Emission weighted toward the *dark* parts of the texture.
+    //
+    // Every building in the city shares one atlas, and the windows in it are
+    // simply its darkest swatches, so there is no second texture to say where
+    // the glass is - but there does not need to be. Weighting the glow by how
+    // dark the albedo is lights the windows and leaves the brickwork alone,
+    // which after dusk is the entire difference between a city and a row of
+    // black boxes.
+    vec3 window_glow;
 };
 
 struct pix_render_instance {
@@ -213,8 +222,12 @@ static void end_frame(pix_renderer& renderer, bool clear_instances = true);
 // ------------------- implementation ---------------------
 
 static void pix_set_time_of_day(pix_renderer& r, float hour) {
+    // Wrapped here rather than only inside the lookup, so winding the clock
+    // backwards past midnight leaves a clock reading of 23:00 and not -1:00.
+    hour = fmodf(hour, 24.0f);
+    if (hour < 0.0f) hour += 24.0f;
     r.hour = hour;
-    pix_daylight_at(hour, &r.sun, &r.sky);
+    pix_daylight_at(hour, &r.sun, &r.sky, &r.exposure);
     r.night = pix_night_factor(r.sun);
 }
 
@@ -297,12 +310,10 @@ static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 
     // the sun sits well above 1, the sky/ground terms are pre-integrated diffuse
     // irradiance. Ambient still has to stay well under the sun or shadowed faces
     // wash out and the shadow map stops being visible - the point of casting it.
-    pix_set_time_of_day(r, 10.0f);      // a late morning, shadows short and legible
     pix_lights_clear(r.lights);
     r.shadow_strength = 1.0f;
     r.shadow_extent = 220.0f;
     r.shadow_depth  = 620.0f;
-    r.exposure      = 0.95f;
     r.saturation    = 1.10f;
     // threshold just above diffuse white, so only genuine speculars glare
     r.bloom_threshold = 1.05f;
@@ -316,6 +327,7 @@ static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 
     r.water_shallow = v3(0.13f, 0.22f, 0.19f);
     r.water_deep    = v3(0.03f, 0.07f, 0.08f);
     r.water_depth   = 2.1f;
+    pix_set_time_of_day(r, 10.0f);      // a late morning, shadows short and legible
     for (int c = 0; c < SHADOW_CASCADES; c++) r.light_space[c] = mat4_identity();
     return r;
 }
@@ -444,6 +456,7 @@ static idx load_material(pix_renderer& r, const char* texture_path, vec3 color, 
     mat.metallic = metalic;
     mat.roughness = roughness;
     mat.emissive = v3(0.0f, 0.0f, 0.0f);
+    mat.window_glow = v3(0.0f, 0.0f, 0.0f);
 
     if (texture_path) {
         png_result png = {};
@@ -467,6 +480,7 @@ static idx load_material_image(pix_renderer& r, image_file_data* image, vec3 col
     mat.metallic = metalic;
     mat.roughness = roughness;
     mat.emissive = v3(0.0f, 0.0f, 0.0f);
+    mat.window_glow = v3(0.0f, 0.0f, 0.0f);
     if (image && image->data)
         mat.texture = opengl_create_texture2d(image->width, image->height, 4, image->data,
                                               pixelated ? TEXTURE_PIXELATED : TEXTURE_LINEAR);
@@ -484,6 +498,7 @@ static idx clone_material(pix_renderer& r, idx source, vec3 color,
     mat.metallic = metallic;
     mat.roughness = roughness;
     mat.emissive = r.materials[source].emissive;
+    mat.window_glow = r.materials[source].window_glow;
     return id;
 }
 
@@ -610,6 +625,7 @@ static void pix__draw_instanced(pix_renderer& r, idx program, bool with_material
     GLint u_metallic = with_material ? glGetUniformLocation(program, "uMetallic")  : -1;
     GLint u_rough    = with_material ? glGetUniformLocation(program, "uRoughness") : -1;
     GLint u_emissive = with_material ? glGetUniformLocation(program, "uEmissive")  : -1;
+    GLint u_glow     = with_material ? glGetUniformLocation(program, "uWindowGlow") : -1;
 
     glBindVertexArray(r.vao);
     glBindBuffer(GL_ARRAY_BUFFER, r.instances_vbo);
@@ -634,6 +650,7 @@ static void pix__draw_instanced(pix_renderer& r, idx program, bool with_material
             glUniform1f(u_metallic, mat.metallic);
             glUniform1f(u_rough, mat.roughness);
             glUniform3f(u_emissive, mat.emissive.x, mat.emissive.y, mat.emissive.z);
+            glUniform3f(u_glow, mat.window_glow.x, mat.window_glow.y, mat.window_glow.z);
         }
 
         mesh& me = r.meshes[mi];
@@ -652,6 +669,7 @@ static void pix__draw_skinned(pix_renderer& r, idx program, bool with_material) 
     GLint u_metallic = with_material ? glGetUniformLocation(program, "uMetallic")  : -1;
     GLint u_rough    = with_material ? glGetUniformLocation(program, "uRoughness") : -1;
     GLint u_emissive = with_material ? glGetUniformLocation(program, "uEmissive")  : -1;
+    GLint u_glow     = with_material ? glGetUniformLocation(program, "uWindowGlow") : -1;
     GLint u_model = glGetUniformLocation(program, "uModel");
     GLint u_bones = glGetUniformLocation(program, "uBones[0]");
     if (u_bones < 0) u_bones = glGetUniformLocation(program, "uBones");
@@ -670,6 +688,7 @@ static void pix__draw_skinned(pix_renderer& r, idx program, bool with_material) 
             glUniform1f(u_metallic, mat.metallic);
             glUniform1f(u_rough, mat.roughness);
             glUniform3f(u_emissive, mat.emissive.x, mat.emissive.y, mat.emissive.z);
+            glUniform3f(u_glow, mat.window_glow.x, mat.window_glow.y, mat.window_glow.z);
         }
         glUniformMatrix4fv(u_model, 1, GL_FALSE, inst.transform.data);
 

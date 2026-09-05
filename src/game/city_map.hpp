@@ -1125,8 +1125,6 @@ static void city__lay_railway(city_world& w, const city_catalog& cat, phys_world
 #define BANK_WALL_DEPTH  0.35f
 
 static void city__fence_water(city_world& w, const city_catalog& cat, phys_world& phys) {
-    const city_model* rail = city_get(cat, cat.singles[ONE_FENCE]);
-
     for (int z = 0; z < CITY_CELLS; z++)
         for (int x = 0; x < CITY_CELLS; x++) {
             if (!city_is_water(w, x, z)) continue;
@@ -1159,11 +1157,11 @@ static void city__fence_water(city_world& w, const city_catalog& cat, phys_world
                              edge.z + fabsf(half.z) + fabsf(thick.z));
                 phys_add_static_box(phys, lo, hi);
 
-                // and the railing that shows where the wall is
-                if (rail)
-                    city__prop(w, rail, v3(edge.x, top, edge.z), along_yaw,
-                               rail->scale, PROP_FADE_MID);
-
+                // Nothing is drawn for it. The bank already carries a stone
+                // retaining wall from the ground pass, which is what an
+                // embankment looks like; a garden fence on top of it turned the
+                // whole waterfront into a brick maze, and it was covering the
+                // one piece of geometry that was already saying "edge" clearly.
                 // something moored against the bank now and then
                 if (!decked && rng_chance(r, 0.10f)) {
                     const city_model* boat = city_pick(cat, SET_PARK_FEATURE, 10);  // the canoe

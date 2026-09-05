@@ -298,6 +298,7 @@ uniform vec3  uColor;
 uniform float uMetallic;
 uniform float uRoughness;
 uniform vec3  uEmissive;      // linear radiance added straight to the result
+uniform vec3  uWindowGlow;    // the same, but only out of the texture's dark patches
 
 uniform vec3  uSunDir;        // normalised, pointing toward the sun
 uniform vec3  uSunColor;      // linear radiance
@@ -352,7 +353,12 @@ void main() {
     // down-facing crevices see less of the sky
     float ao = mix(0.45, 1.0, hemi);
 
-    vec3 color = direct + (amb_diffuse + amb_spec) * ao + uEmissive;
+    // The window term. Cubed so the separation is sharp: a dark swatch keeps
+    // nearly all of it and a light one keeps an eighth, which reads as lit
+    // glass in a wall rather than as a wall that has been turned up.
+    float dark = 1.0 - clamp(dot(albedo, vec3(0.2126, 0.7152, 0.0722)) * 6.0, 0.0, 1.0);
+    vec3 color = direct + (amb_diffuse + amb_spec) * ao
+               + uEmissive + uWindowGlow * (dark * dark * dark);
 
     float fog = 1.0 - exp(-view_depth * view_depth * uFogDensity * uFogDensity);
     frag = vec4(mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0)), 1.0);

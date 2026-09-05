@@ -1,0 +1,142 @@
+props=19154 statics=4149 models=169 meshes=201 verts=579427
+roads=2371 walk=4066 blocks=113  quadmodel=167 quadmesh=199
+road model 0 -> mesh 0
+road model 1 -> mesh 1
+road model 2 -> mesh 2
+road model 3 -> mesh 3
+road model 4 -> mesh 4
+road model 5 -> mesh 5
+rig rest bbox x[-0.569 0.569] y[-0.000 1.507] z[-0.131 0.181] scale=1.1948 -> 1.80 m
+set  0 count  6 first: w=8.00 h=0.40 d=8.00 m (scale 4.00)
+set  1 count  5 first: w=13.60 h=28.80 d=13.60 m (scale 10.00)
+set  2 count 14 first: w=8.84 h=12.93 d=9.40 m (scale 10.00)
+set  3 count 14 first: w=5.00 h=20.00 d=5.00 m (scale 10.00)
+set  4 count  6 first: w=4.00 h=4.00 d=1.48 m (scale 10.00)
+set  5 count 21 first: w=13.00 h=8.34 d=10.28 m (scale 10.00)
+set  6 count 17 first: w=4.75 h=2.70 d=0.75 m (scale 10.00)
+set  7 count 11 first: w=1.08 h=3.84 d=0.28 m (scale 4.00)
+set  8 count  8 first: w=2.10 h=7.67 d=2.43 m (scale 10.00)
+set  9 count 15 first: w=3.02 h=6.83 d=2.62 m (scale 4.00)
+set 10 count 14 first: w=1.58 h=0.98 d=1.58 m (scale 4.00)
+set 11 count 10 first: w=1.44 h=0.76 d=1.44 m (scale 4.00)
+set 12 count 12 first: w=1.20 h=4.00 d=1.20 m (scale 4.00)
+set 13 count  4 first: w=2.00 h=2.68 d=2.00 m (scale 4.00)
+set 14 count  2 first: w=4.00 h=0.40 d=16.00 m (scale 4.00)
+set 15 count  8 first: w=5.72 h=6.64 d=10.40 m (scale 4.00)
+vehicle 0: 2.55 x 2.21 x 4.34 m wheels=1
+vehicle 1: 2.21 x 1.87 x 4.34 m wheels=1
+vehicle 2: 2.21 x 1.87 x 4.84 m wheels=1
+vehicle 3: 2.55 x 2.21 x 4.59 m wheels=1
+props using a road mesh = 2371
+................................................................................................................
+..::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::..
+.:#########+#######+########+########+#########+##########+#######+###########+#######+########+##############:.
+.:#::::::::#:::::::#::::::::#::::::::#:::::::::#::::::::::#:::::::#:::::::::::#:::::::#::::::::#:::::::::::::#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBB:#:BBBBBBB:#:TTTTTTTT:#:BBBBB:#:BBBBBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBBBBBBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBB:#:BBBBBBB:#:TTTTTTTT:#:BBBBB:#:BBBBBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBBBBBBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBooBB:#:BBooBB:#:BBoooBB:#:TTTTTTTT:#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBooBB:#:BBooBB:#:BBoooBB:#:TTTTTTTT:#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBooBB:#:BBooBB:#:BBoooBB:#:TTTTTTTT:#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBooBB:#:BBooBB:#:BBoooBB:#:TTTTTTTT:#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBooBB:#:BBooBB:#:BBBBBBB:#::::::::::#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#::::::::#:::::::#:BBooBB:#:BBooBB:#:BBBBBBB:+##########+:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:+########+#######+:BBBBBB:#:BBBBBB:#:::::::::#::::::::::#:BBoBB:#:BBoooooBB:#:BBoBB:#:BBooBB:#:BBoooooooBB:#:.
+.:#::::::::#:::::::#:BBBBBB:#:BBBBBB:+#########+:BBBBBBBB:#:BBBBB:#:BBBBBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBBBBBBB:#:.
+.:#:TTTTTT:#:BBBBB:#::::::::#::::::::#:::::::::#:BBBBBBBB:#:BBBBB:#:BBBBBBBBB:#:BBBBB:#:BBBBBB:#:BBBBBBBBBBB:#:.
+.:#:TTTTTT:#:BBBBB:+#######++########+:BBBBBBB:#:BBooooBB:#:::::::#:::::::::::#:::::::#::::::::#:::::::::::::#:.
+.:#:TTTTTT:#:BBoBB:#:::::::#:::::::::#:BBBBBBB:#:BBooooBB:+#######+#+#######+#+######++######+#+#####+#######+:.
+.:#:TTTTTT:#:BBoBB:#:BBBBB:#:BBBBBBB:#:BBoooBB:#:BBooooBB:#:::::::::#:::::::#::::::::#:::::::#:::::::#:::::::#:.
+.:#:TTTTTT:#:BBBBB:#:BBBBB:#:BBBBBBB:#:BBoooBB:#:BBooooBB:#:BBBBBBB:#:BBBBB:#:BBBBBB:#:TTTTT:#:BBBBB:#:BBBBB:#:.
+.:#::::::::#:BBBBB:#:BBoBB:#:BBoooBB:#:BBoooBB:#:BBooooBB:#:BoBoBBB:#:BBBBB:#:BBBBBB:#:TTTTT:#:BBBBB:#:BBBBB:#:.
+.:+########+:::::::#:BBBBB:#:BBBBBBB:#:BBBBBBB:#:BBBBBBBB:#:BBooooB:#:BBoBB:#:BBooBB:#:TTTTT:#:BBoBB:#:BBoBB:#:.
+.:#::::::::+#######+:BBBBB:#:BBBBBBB:#:BBBBBBB:#:BBBBBBBB:#:BBoooBB:#:BBoBB:#:BBooBB:#:TTTTT:#:BBoBB:#:BBoBB:#:.
+.:#:BBBBBB:#:::::::#:::::::#:::::::::#:::::::::#::::::::::#:BBoooBB:#:BBBBB:#:BBBBBB:#:TTTTT:#:BBBBB:#:BBBBB:#:.
+.:#:BBBBBB:#:BBBBB:+#######+#+#######+#########+#+########+:BooooBB:#:BBBBB:#:BBBBBB:#:::::::#:BBBBB:#:BBBBB:#:.
+.:#:BBooBB:#:BBBBB:#:::::::::#:::::::#:::::::::::#::::::::#:BooooBB:#:::::::#::::::::+#######+:::::::#:::::::#:.
+.:#:BBooBB:#:BBoBB:#:BBBBBBB:#:BBBBB:#:BBBBBBBBB:#:BBBBBB:#:BoooooB:+#######++#######+:::::::+#######+#######+:.
+.:#:BBBBBB:#:BBBBB:#:BBBBBBB:#:BBBBB:#:BBooBoooB:#:BBooBB:#:BoooooB:#::::::::#:::::::#:BBBBB:#:::::::#:::::::#:.
+.:#:BBBBBB:#:BBBBB:#:BBoooBB:#:BBoBB:#:BBooooooB:#:BoooBB:#:BBooooB:#:BBBBBB:#:BBBBB:#:BBBBB:#:BBBBB:#:BBBBB:#:.
+.:#::::::::#:::::::#:BBoooBB:#:BBoBB:#:BBooooooB:#:BBoooB:#:BBBBBoB:#:BBBBoB:#:BBBBB:#:BBoBB:#:BBBBB:#:BBBBB:#:.
+.:+#######++#######+:BBoooBB:#:BBoBB:#:BBooooooB:#:BBoooB:#:BBBBBBB:#:BBooBB:#:BBoBB:#:BBoBB:#:BBoBB:#:BBoBB:#:.
+.:#:::::::#::::::::#:BBoooBB:#:BBoBB:#:BooooooBB:#:BBooBB:#:::::::::#:BBooBB:#:BBoBB:#:BBoBB:#:BBoBB:#:BBoBB:#:.
+.:#:BBBBB:#:TTTTTT:#:BBoooBB:#:BBoBB:#:BBoooooBB:#:BBBBBB:+#########+:BBBBoB:#:BBBBB:#:BBBBB:#:BBBBB:#:BBBBB:#:.
+.:#:BBBBB:#:TTTTTT:#:BBoooBB:#:BBoBB:#:BooooooBB:#::::::::#:::::::::#:BBBBBB:#:BBBBB:#:BBBBB:#:BBBBB:#:BBBBB:#:.
+.:#:BBoBB:#:TTTTTT:#:BBoooBB:#:BBoBB:#:BBoooooBB:+########+:BBBBBBB:#::::::::#:::::::#:::::::#:::::::#:::::::#:.
+.:#:BBoBB:#:TTTTTT:#:BBBBBBB:#:BBBBB:#:BBBBBBooB:#::::::::#:BBoBooB:+#######++######++#######+###+###+#######+:.
+.:#:BBoBB:#:TTTTTT:#:BBBBBBB:#:BBBBB:#:BBBBBBBBB:#:BBBBBB:#:BBooooB:#:::::::#:::::::#::::::::::::#:::::::::::#:.
+.:#:BBoBB:#:TTTTTT:#:::::::::#:::::::#:::::::::::#:BooBBB:#:BBoooBB:#:BBBBB:#:BBBBB:#:BBBBBBBBBB:#:TTTTTTTTT:#:.
+.:#:BBoBB:#:TTTTTT:+#########+##+####+##+########+:BBooBB:#:BBoooBB:#:BoBoB:#:BBBBB:#:BBBBBBBBBB:#:TTTTTTTTT:#:.
+.:#:BBoBB:#:TTTTTT:#::::::::::::#:::::::#::::::::#:BBooBB:#:BBooooB:#:BoooB:#:BBoBB:#:BBooooooBB:#:TTTTTTTTT:#:.
+.:#:BBBBB:#:TTTTTT:#:BBBBBBBBBB:#:BBBBB:#:BBBBBB:#:BoooBB:#:BoBBBBB:#:BoooB:#:BooBB:#:BBooooooBB:#:TTTTTTTTT:#:.
+.:#:BBBBB:#:TTTTTT:#:BBBBBBBBBB:#:BBoBB:#:BBBBBB:#:BBooBB:#:BBBBBBB:#:BBBBB:#:BBooB:#:BBooooooBB:#:TTTTTTTTT:#:.
+.:#:::::::#::::::::#:BBooooooBB:#:BooBB:#:BoooBB:#:BBooBB:#:::::::::#:BBBBB:#:BBBBB:#:BBBBBBBBBB:#:TTTTTTTTT:#:.
+.:+#######++#######+:BBBBBBBBBB:#:BBBBB:#:BBooBB:#:BooooB:+#########+:::::::#:::::::#:BBBBBBBBBB:#:TTTTTTTTT:#:.
+.:#::::::::#:::::::#:BBBBBBBBBB:#:BBBBB:#:BBBBBB:#:BBBBoB:#:::::::::+#######+#######+::::::::::::#:TTTTTTTTT:#:.
+.:#:BBBBBB:#:TTTTT:#::::::::::::#:::::::#::::::::#:BBBBBB:#:BBBBBBB:#:::::::#:::::::+############+:TTTTTTTTT:#:.
+.:#:BBBBBB:#:TTTTT:+############+#######++#######+::::::::#:BooBoBB:#:BBBBB:#:BBBBB:#::::::::::::#:::::::::::#:.
+.:#:BBooBB:#:TTTTT:#::::::::::::#::::::::#:::::::+########+:BBooooB:#:BBooB:#:BBoBB:#:BBBBBBBBBB:+###########+:.
+.:#:BBBBBB:#:TTTTT:#:BBBBBBBBBB:#:BBBBBB:#:BBBBB:#::::::::#:BBooooB:#:BoooB:#:BBoBB:#:BBBBBBBBBB:#:::::::::::#:.
+.:#:BBBBBB:#:TTTTT:#:BBBoBoBoBB:#:BBoBBB:#:BBBBB:#:BBBBBB:#:BoooooB:#:BBoBB:#:BBoBB:#:BBooooooBB:#:BBBBBBBBB:#:.
+.:#::::::::#:::::::#:BoooooooBB:#:BooooB:#:BooBB:#:BBBBBB:#:BBoooBB:#:BBoBB:#:BBooB:#:BBooooooBB:#:BBBBBBBBB:#:.
+.:+########+#######+:BBooooooBB:#:BoooBB:#:BooBB:#:BBooBB:#:BBoooBB:#:BoooB:#:BBooB:#:BBooooooBB:#:BBoooooBB:#:.
+.:#::::::::#:::::::#:BBooooooBB:#:BoooBB:#:BBoBB:#:BBooBB:#:BBoooBB:#:BBooB:#:BBoBB:#:BBooooooBB:#:BBoooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBooBBBBBB:#:BBoBBB:#:BooBB:#:BBBBBB:#:BBoooBB:#:BooBB:#:BooBB:#:BBooooooBB:#:BBoooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBBBBBBB:#:BBBBBB:#:BBBBB:#:BBBBBB:#:BBBBooB:#:BooBB:#:BBooB:#:BBBBBBBBBB:#:BBBBBBBBB:#:.
+.:#:BBooBB:#:BBoBB:#::::::::::::#::::::::#:::::::#::::::::#:BBBBBBB:#:BBBBB:#:BBBBB:#:BBBBBBBBBB:#:BBBBBBBBB:#:.
+.:#:BBBBBB:#:BBBBB:+#######+####+####+###+######++########+:::::::::#:BBBBB:#:BBBBB:#::::::::::::#:::::::::::#:.
+.:#:BBBBBB:#:BBBBB:#:::::::#:::::::::#::::::::::#:::::::::+#########+:::::::#:::::::+########+###+###+#######+:.
+.:#::::::::#:::::::#:TTTTT:#:BBBBBBB:#:BBBBBBBB:#:BBBBBBB:#:::::::::+#######+#######+::::::::#:::::::#:::::::#:.
+.:+########+#######+:TTTTT:#:BBBooBB:#:BBBBBBBB:#:BBBBBBB:#:BBBBBBB:#:::::::#:::::::#:BBBBBB:#:BBBBB:#:BBBBB:#:.
+.:#::::::::#:::::::#:TTTTT:#:BooooBB:#:BBooooBB:#:BBoooBB:#:BBBBBBB:#:BBBBB:#:BBBBB:#:BBBBBB:#:BBBBB:#:BBBBB:#:.
+.:#:BBBBBB:#:TTTTT:#:TTTTT:#:BBoooBB:#:BBooooBB:#:BBoooBB:#:BooooBB:#:BBoBB:#:BBBBB:#:BBooBB:#:BBoBB:#:BBoBB:#:.
+.:#:BBBBBB:#:TTTTT:#:TTTTT:#:BooooBB:#:BBoooooB:#:BBoooBB:#:BBoooBB:#:BBooB:#:BBoBB:#:BBooBB:#:BBoBB:#:BBoBB:#:.
+.:#:BBooBB:#:TTTTT:#:TTTTT:#:BBoooBB:#:BBoooooB:#:BBoooBB:#:BooooBB:#:BoooB:#:BooBB:#:BBooBB:#:BBoBB:#:BBoBB:#:.
+.:#:BBooBB:#:TTTTT:#:TTTTT:#:BBooooB:#:BBoBBBBB:#:BBBBBBB:#:BoBBBBB:#:BBoBB:#:BBBBB:#:BBBBBB:#:BBBBB:#:BBBBB:#:.
+.:#:BBBBBB:#:TTTTT:#:TTTTT:#:BBBBBBB:#:BBBBBBBB:#:BBBBBBB:#:BBBBBBB:#:BBBBB:#:BBBBB:#:BBBBBB:#:BBBBB:#:BBBBB:#:.
+.:#:BBBBBB:#:TTTTT:#:::::::#:::::::::#::::::::::#:::::::::#:::::::::#:::::::#:::::::#::::::::#:::::::#:::::::#:.
+.:#::::::::#:::::::+#######+#+#######+###+######+#+#######+##+######+#######+#######+##+#####+##+####+#######+:.
+.:+#######++#######+:::::::::#:::::::::::#::::::::#::::::::::#::::::::::::::#::::::::::#::::::::#::::::::::::#:.
+.:#:::::::#::::::::#:BBBBBBB:#:BBBBBBBBB:#:BBBBBB:#:BBBBBBBB:#:BBBBBBBBBBBB:#:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBB:#:BBBBBB:#:BBBBBBB:#:BoBBBBooB:#:BBBoBB:#:BoBoooBB:#:BBBoBBBBoBoB:#:BoooooBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBB:#:BBBBBB:#:BBoooBB:#:BBooooooB:#:BooooB:#:BooooooB:#:BBoooooooooB:#:BBooooBB:#:BBooBB:#:BBooooooBB:#:.
+.:#:BBoBB:#:BBooBB:#:BBoooBB:#:BooooooBB:#:BBoooB:#:BooooooB:#:BBooooooooBB:#:BBooBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBoBB:#:BBooBB:#:BBoooBB:#:BooooooBB:#:BBoooB:#:BooooooB:#:BBooooooooBB:#:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBoBB:#:BBooBB:#:BBoooBB:#:BBooooooB:#:BoBBoB:#:BBBBBBBB:#:BoooooooooBB:#::::::::::#::::::::#::::::::::::#:.
+.:#:BBoBB:#:BBooBB:#:BBoooBB:#:BoooooooB:#:BBBBBB:#:BBBBBBBB:#:BBooooooooBB:+##########+########+############+:.
+.:#:BBoBB:#:BBooBB:#:BBoooBB:#:BoooooooB:#::::::::#::::::::::#:BBoooooooooB:#::::::::::#::::::::#::::::::::::#:.
+.:#:BBBBB:#:BBBBBB:#:BBBBBBB:#:BBBBooBBB:+########+#+########+:BooooooooooB:#:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBB:#:BBBBBB:#:BBBBBBB:#:BBBBBBBBB:#::::::::::#::::::::#:BBooBBooBBBB:#:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:::::::#::::::::#:::::::::#:::::::::::#:BBBBBBBB:#:TTTTTT:#:BBBBBBBBBBBB:#:BBooooBB:#:BBooBB:#:BBooooooBB:#:.
+.:+#######+########+#########++##########+:BoBBBBBB:#:TTTTTT:#::::::::::::::#:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:::::::#::::::::#::::::::::#::::::::::#:BoooooBB:#:TTTTTT:+##############+:BBBBBBBB:#:BBBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBB:#:BBBBBB:#:BBBBBBBB:#:BBBBBBBB:#:BoooooBB:#:TTTTTT:#::::::::::::::#::::::::::#::::::::#::::::::::::#:.
+.:#:BBBBB:#:BBBBBB:#:BBBBBBBB:#:BBBBBBBB:#:BoooooBB:#:TTTTTT:#:TTTTTTTTTTTT:+##########++#######+############+:.
+.:#:BBoBB:#:BBooBB:#:BBooooBB:#:BBooooBB:#:BoooooBB:#:TTTTTT:#:TTTTTTTTTTTT:#:::::::::::#:::::::#::::::::::::#:.
+.:#:BBBBB:#:BBBBBB:#:BBooooBB:#:BBooooBB:#:BoooooBB:#:TTTTTT:#:TTTTTTTTTTTT:#:TTTTTTTTT:#:BBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBB:#:BBBBBB:#:BBooooBB:#:BBooooBB:#:BBooooBB:#:TTTTTT:#:TTTTTTTTTTTT:#:TTTTTTTTT:#:BBBBB:#:BBBBBBBBBB:#:.
+.:#:::::::#::::::::#:BBooooBB:#:BBooooBB:#:BoooooBB:#:TTTTTT:#:TTTTTTTTTTTT:#:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:+#######++#######+:BBooooBB:#:BBooooBB:#:BoooooBB:#:TTTTTT:#::::::::::::::#:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:#::::::::#:::::::#:BBBBBBBB:#:BBBBBBBB:#:BBBBoooB:#:TTTTTT:+##############+:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBBBBB:#:BBBBBBBB:#:BBBBBBBB:#:TTTTTT:#::::::::::::::#:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#::::::::::#::::::::::#::::::::::#::::::::#:BBBBBBBBBBBB:#:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:#:BBooBB:#:BBoBB:+########+#+#####+####+###+######++#######+:BBBBBBBBBBBB:#:TTTTTTTTT:#:BBoBB:#:BBooooooBB:#:.
+.:#:BBooBB:#:BBoBB:#::::::::#:::::::#::::::::#:::::::#:::::::#:BBooooooooBB:#:::::::::::#:BBoBB:#:BBooooooBB:#:.
+.:#:BBooBB:#:BBoBB:#:TTTTTT:#:BBBBB:#:BBBBBB:#:BBBBB:#:BBBBB:#:BBooooooooBB:+###########+:BBoBB:#:BBooooooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:TTTTTT:#:BBBBB:#:BBBBBB:#:BBBBB:#:BBBBB:#:BBooooooooBB:#:::::::::::#:BBBBB:#:BBBBBBBBBB:#:.
+.:#:BBBBBB:#:BBBBB:#:TTTTTT:#:BBoBB:#:BBooBB:#:BBoBB:#:BBoBB:#:BBBBBBBBBBBB:#:BBBBBBBBB:#:BBBBB:#:BBBBBBBBBB:#:.
+.:#::::::::#:::::::#:TTTTTT:#:BBBBB:#:BBBBBB:#:BBoBB:#:BBoBB:#:BBBBBBBBBBBB:#:BBBBBBBBB:#:::::::#::::::::::::#:.
+.:+########+#######+:TTTTTT:#:BBBBB:#:BBBBBB:#:BBoBB:#:BBoBB:#::::::::::::::#:BBoooooBB:+#######+##+#########+:.
+.:#::::::::#:::::::#::::::::#:::::::#::::::::#:BBBBB:#:BBBBB:+##############+:BBBBBBBBB:#::::::::::#:::::::::#:.
+.:#:BBBBBB:#:BBBBB:+#######++#######+########+:BBBBB:#:BBBBB:#::::::::::::::#:BBBBBBBBB:#:BBBBBBBB:#:BBBBBBB:#:.
+.:#:BBBBBB:#:BBBBB:#:::::::#::::::::#::::::::#:::::::#:::::::#:BBBBBBBBBBBB:#:::::::::::#:BBBBBBBB:#:BBBBBBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBBBB:#:BBBBBB:#:TTTTTT:+#######+#######+:BBBBBBBBBBBB:+###########+:BBooooBB:#:BBoooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBBBB:#:BBBBBB:#:TTTTTT:#:::::::#:::::::#:BBooooooooBB:#:::::::::::#:BBooooBB:#:BBoooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBoBB:#:BBooBB:#:TTTTTT:#:BBBBB:#:BBBBB:#:BBooooooooBB:#:BBBBBBBBB:#:BBooooBB:#:BBoooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBoBB:#:BBooBB:#:TTTTTT:#:BBBBB:#:BBBBB:#:BBooooooooBB:#:BBBBBBBBB:#:BBooooBB:#:BBoooBB:#:.
+.:#:BBooBB:#:BBoBB:#:BBoBB:#:BBooBB:#:TTTTTT:#:BBoBB:#:BBoBB:#:BBooooooooBB:#:BBoooooBB:#:BBooooBB:#:BBoooBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBB:#:BBBBBB:#:TTTTTT:#:BBBBB:#:BBBBB:#:BBBBBBBBBBBB:#:BBBBBBBBB:#:BBBBBBBB:#:BBBBBBB:#:.
+.:#:BBBBBB:#:BBBBB:#:BBBBB:#:BBBBBB:#:TTTTTT:#:BBBBB:#:BBBBB:#:BBBBBBBBBBBB:#:BBBBBBBBB:#:BBBBBBBB:#:BBBBBBB:#:.
+.:#::::::::#:::::::#:::::::#::::::::#::::::::#:::::::#:::::::#::::::::::::::#:::::::::::#::::::::::#:::::::::#:.
+.:#########+#######+#######+########+########+#######+#######+##############+###########+##########+##########:.
+..::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::..
+................................................................................................................

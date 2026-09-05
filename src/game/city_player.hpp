@@ -17,6 +17,26 @@
 #define CAM_CAR_DIST     9.5f
 #define CAM_HEIGHT       1.55f
 
+// How the jump clip's own timeline maps onto a jump.
+//
+// Man_Jump is 1.04 s: a crouch and a launch, feet off the ground at 0.28, back
+// down at 0.68, and a tail of standing still after that. Played as a looping
+// clip on wall-clock time - which is what it was doing - the crouch happens in
+// mid air, the landing happens at the top of the arc, and if the hop is short
+// it never reaches the landing at all.
+//
+// So the clip is driven by the state of the jump instead of by the clock: the
+// launch plays at its own speed on take-off, the airborne section is stretched
+// or squeezed to cover however long the character is actually off the ground,
+// and the landing plays out at its own speed once the feet are back down.
+#define JUMP_LAUNCH_END   0.27f   // fraction of the clip: feet leave the ground
+#define JUMP_AIR_END      0.66f   // fraction of the clip: feet touch down
+#define JUMP_CLIP_END     0.80f   // fraction of the clip: recovered, back to standing
+
+// How long a clip change takes to cross-fade. Long enough to kill the pop,
+// short enough that the character is never visibly in two poses at once.
+#define ANIM_FADE_TIME    0.14f
+
 #define DRIVE_ENGINE_FORCE  11.0f
 #define DRIVE_BRAKE_FORCE   19.0f
 #define DRIVE_REVERSE_SPEED  6.0f
@@ -32,8 +52,15 @@ struct city_player {
     animator anim;
     float    anim_time;
     idx      anim_clip;        // clip currently playing, an animator index
+    // the clip being faded out of, and how far through that fade we are
+    idx      anim_prev_clip;
+    float    anim_prev_time;
+    float    anim_fade;        // 1 at the moment of the switch, ramps to 0
     bool     anim_ready;
+
     bool     airborne;
+    float    air_time;         // seconds since leaving the ground
+    float    land_time;        // seconds left of the landing part of the jump clip
 
     int      car;              // index into city_traffic::cars, -1 when on foot
     float    enter_cooldown;   // stops one keypress toggling twice
@@ -65,7 +92,13 @@ static void city_player_init(city_player& p, pix_data_loader& loader, const city
     b.position = spawn;
     b.radius = PLAYER_RADIUS;
     b.height = PLAYER_HEIGHT;
-    b.inv_mass = 1.0f / 82.0f;
+    // Deliberately far heavier than a pedestrian. The solver splits a
+    // penetration between two bodies by mass, so at equal mass a pavement of
+    // people walking past nudges the player a little further into the road on
+    // every contact until they are standing in the traffic - which is exactly
+    // what a narrow footpath made happen. Weighted like this the crowd parts
+    // around the player instead.
+    b.inv_mass = 1.0f / 600.0f;
     b.restitution = 0.0f;
     b.drag = 9.0f;
     b.group = PHYS_LAYER_PLAYER;
@@ -73,13 +106,14 @@ static void city_player_init(city_player& p, pix_data_loader& loader, const city
     b.gravity = true;
     p.body = phys_add_body(phys, b);
 
-    p.character = (idx)-1;
+    p.character = city_pick_player(cat);
     p.anim_clip = 0;
-    if (cat.character_count) {
-        p.character = 0;                       // the hoodie character leads the cast
+    p.anim_prev_clip = 0;
+    if (p.character < cat.character_count) {
         const city_character& ch = cat.characters[p.character];
         if (ch.ok && city_build_animator(p.anim, loader, ch.model)) {
             p.anim_clip = ch.clips[CLIP_IDLE] != (idx)-1 ? ch.clips[CLIP_IDLE] : 0;
+            p.anim_prev_clip = p.anim_clip;
             animator_play(p.anim, p.anim_clip);
             p.anim_ready = true;
         }
@@ -144,7 +178,7 @@ static void city__exit_car(city_player& p, city_traffic& t, const city_catalog& 
         nb.shape = PHYS_CYLINDER;
         nb.radius = PLAYER_RADIUS;
         nb.height = PLAYER_HEIGHT;
-        nb.inv_mass = 1.0f / 82.0f;
+        nb.inv_mass = 1.0f / 600.0f;
         nb.drag = 9.0f;
         nb.group = PHYS_LAYER_PLAYER;
         nb.collides = PHYS_LAYER_ALL;
@@ -215,11 +249,21 @@ static void city__update_on_foot(city_player& p, const pix_window& window, phys_
 
     if ((window.keystates[' '].pressed || window.gamepads[0].buttons[PAD_A].pressed)
         && b->on_ground) {
-        b->velocity.y = 7.4f;
+        b->velocity.y = PLAYER_JUMP_SPEED;
     }
 
     p.position = b->position;
-    p.airborne = !b->on_ground;
+    bool airborne = !b->on_ground;
+    if (airborne && !p.airborne) p.air_time = 0.0f;      // just left the ground
+    if (!airborne && p.airborne) {
+        // just touched down: hand the rest of the clip to the landing
+        const float dur_frac = JUMP_CLIP_END - JUMP_AIR_END;
+        p.land_time = dur_frac * animator_duration(p.anim, p.anim_clip);
+    }
+    if (airborne) p.air_time += dt;
+    p.airborne = airborne;
+    if (p.land_time > 0.0f) p.land_time -= dt;
+
     p.speed = sqrtf(b->velocity.x * b->velocity.x + b->velocity.z * b->velocity.z);
 }
 
@@ -302,18 +346,21 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
 
     // ---- animation ----
     // A clip per locomotion state rather than one cycle stretched over all of
-    // them: idle when stopped, walk, run, and the jump clip whenever the body
-    // is off the ground. Playback rate still follows ground speed inside walk
-    // and run, so a stroll and a jog are the same clip at different tempos.
+    // them: idle when stopped, walk, run, and the jump clip for as long as the
+    // jump lasts. Playback rate follows ground speed inside walk and run, so a
+    // stroll and a jog are the same clip at different tempos, and every change
+    // of clip is cross-faded rather than cut.
     if (p.anim_ready && p.character < cat.character_count) {
         const city_character& ch = cat.characters[p.character];
         idx want = ch.clips[CLIP_IDLE];
         float rate = 1.0f;
+        bool  jumping = false;
 
         if (!city_player_on_foot(p)) {
             want = ch.clips[CLIP_SIT];                      // behind the wheel
-        } else if (p.airborne && ch.clips[CLIP_JUMP] != (idx)-1) {
+        } else if ((p.airborne || p.land_time > 0.0f) && ch.clips[CLIP_JUMP] != (idx)-1) {
             want = ch.clips[CLIP_JUMP];
+            jumping = true;
         } else if (p.speed > PLAYER_WALK_SPEED * 1.35f) {
             want = ch.clips[CLIP_RUN];
             rate = clampf(p.speed / PLAYER_RUN_SPEED, 0.65f, 1.55f);
@@ -323,9 +370,45 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
         }
         if (want == (idx)-1) want = p.anim_clip;
 
-        if (want != p.anim_clip) { p.anim_clip = want; p.anim_time = 0.0f; }
-        p.anim_time += dt * rate;
-        animator_sample(p.anim, p.anim_clip, p.anim_time, &p.anim.pose);
+        if (want != p.anim_clip) {
+            p.anim_prev_clip = p.anim_clip;
+            p.anim_prev_time = p.anim_time;
+            p.anim_fade = 1.0f;
+            p.anim_clip = want;
+            p.anim_time = 0.0f;
+        }
+
+        if (jumping) {
+            // Position inside the jump clip is read off the jump, not the
+            // clock. Airborne, the clip's flight section is stretched over
+            // however long the arc actually takes; landed, the recovery plays
+            // out at its own speed.
+            float duration = animator_duration(p.anim, p.anim_clip);
+            float u;
+            if (p.airborne) {
+                float flight = clampf(p.air_time / PLAYER_AIR_TIME, 0.0f, 1.0f);
+                u = JUMP_LAUNCH_END + (JUMP_AIR_END - JUMP_LAUNCH_END) * flight;
+            } else {
+                float recover = clampf(1.0f - p.land_time
+                                       / ((JUMP_CLIP_END - JUMP_AIR_END) * duration + 1e-4f),
+                                       0.0f, 1.0f);
+                u = JUMP_AIR_END + (JUMP_CLIP_END - JUMP_AIR_END) * recover;
+            }
+            p.anim_time = u * duration;
+        } else {
+            p.anim_time += dt * rate;
+        }
+
+        if (p.anim_fade > 0.0f) {
+            p.anim_prev_time += dt;
+            p.anim_fade -= dt / ANIM_FADE_TIME;
+            if (p.anim_fade < 0.0f) p.anim_fade = 0.0f;
+        }
+
+        // fade runs 1 -> 0 away from the old clip, so the blend weight toward
+        // the new one is its complement
+        animator_sample_blend(p.anim, p.anim_prev_clip, p.anim_prev_time,
+                              p.anim_clip, p.anim_time, 1.0f - p.anim_fade, &p.anim.pose);
     }
 }
 
@@ -361,6 +444,6 @@ static void city_player_draw(const city_player& p, const city_catalog& cat,
     pix_render_instance inst = {};
     inst.mesh = ch.mesh;
     inst.material = ch.materials[0];
-    inst.trainsform = mat4_trs_y(p.position, p.yaw + ch.yaw_offset, ch.scale);
+    inst.transform = mat4_trs_y(p.position, p.yaw + ch.yaw_offset, ch.scale);
     push_animated_instance(renderer, inst, p.anim.pose);
 }

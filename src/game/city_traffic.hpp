@@ -11,14 +11,25 @@
 // be. On arrival it picks the next cell, preferring to carry straight on, so
 // traffic flows down a street instead of milling about.
 //
-// On top of that navigation sit the three behaviours that make it read as
+// On top of that navigation sit the four behaviours that make it read as
 // traffic rather than as moving objects:
 //
-//   * lights   every junction shares one phase, so a whole avenue goes green
-//              together and you can catch a green wave
-//   * following a car brakes for whatever is in the cone ahead of it, which
-//              produces queues at red lights without any queue logic
-//   * yielding pedestrians in the road stop a car dead
+//   * lights     every junction shares one phase, so a whole avenue goes green
+//                together and you can catch a green wave
+//   * following  a car brakes for whatever is in the cone ahead of it, which
+//                produces queues at red lights without any queue logic
+//   * yielding   pedestrians in the road stop a car dead
+//   * reserving  a junction cell is claimed by one car at a time
+//
+// That last one is what stops junctions clotting. Braking for what is in front
+// only works while "in front" means the direction the car is pointing, and at a
+// junction the car it is about to hit is the one crossing it side-on, which no
+// forward cone ever sees. So a junction box is a resource: a car may only enter
+// it if nothing else has claimed it, may only claim it if it can also see a way
+// out the far side (which is what "do not block the box" means), and gives it up
+// the moment it is through. Junctions only - a straight two-way street would
+// gridlock instantly if opposing traffic had to take turns down it, and there
+// the lane offset already keeps the two directions apart.
 //
 // Steering is a kinematic bicycle model, and the result is handed to the
 // physics body as a velocity - so a car that clips a building or another car
@@ -26,9 +37,13 @@
 
 #define CAR_LENGTH_SCALE  0.85f    // wheelbase as a fraction of body length
 #define CAR_MAX_SPEED     15.5f
-#define CAR_ACCEL         7.0f
-#define CAR_BRAKE        18.0f
-#define CAR_LOOKAHEAD     9.0f
+#define CAR_ACCEL          7.0f
+#define CAR_BRAKE         18.0f
+// Far enough that a car at CAR_MAX_SPEED can still stop inside it: 15.5 m/s
+// against CAR_BRAKE needs 6.7 m, and the rest is the gap it keeps once stopped.
+#define CAR_LOOKAHEAD     14.0f
+#define CAR_GAP            2.2f    // bumper to bumper, stationary
+#define CAR_CLAIM_NONE   0xFFFFu
 
 struct city_car {
     bool    active;
@@ -44,6 +59,7 @@ struct city_car {
 
     int     node_x, node_z; // the road cell being driven from
     int     next_x, next_z; // the road cell being driven to
+    int     claim_x, claim_z;  // junction cell reserved for this car, -1 if none
     float   blocked_time;   // how long it has been unable to move
     float   brake_light;    // 0..1, for anything that wants to show it
 };
@@ -51,26 +67,48 @@ struct city_car {
 struct city_traffic {
     city_car cars[MAX_CARS];
     size_t   count;
+    // which car owns each junction box, CAR_CLAIM_NONE for free. One byte short
+    // per cell over the whole map is cheaper than any sparse structure and
+    // needs no rebuild.
+    uint16_t claim[CITY_CELLS * CITY_CELLS];
     rng      random;
 };
-
-static void city_traffic_init(city_traffic& t, uint32_t seed);
-static void city_traffic_update(city_traffic& t, city_world& world, const city_catalog& cat,
-                                phys_world& phys, vec3 focus, float time, float dt);
-static void city_traffic_draw(const city_traffic& t, const city_catalog& cat,
-                              pix_renderer& renderer, const frustum& view, vec3 eye);
-
-// spawns one car on a road cell; returns its index or -1
-static int  city_traffic_spawn(city_traffic& t, const city_world& w, const city_catalog& cat,
-                               phys_world& phys, int cx, int cz);
-// draws a single car, shared by the traffic pass and the player's own vehicle
-static void city_car_draw(const city_car& car, const city_catalog& cat, pix_renderer& renderer);
 
 // ---------------- implementation ----------------
 
 static void city_traffic_init(city_traffic& t, uint32_t seed) {
     memset(&t, 0, sizeof(t));
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++) t.claim[i] = CAR_CLAIM_NONE;
     t.random = rng_seed(seed);
+}
+
+// ---- junction reservations ----
+
+static bool city__is_junction(const city_world& w, int x, int z) {
+    return city_in_bounds(x, z) && (city_at(w, x, z).flags & CELLF_JUNCTION) != 0;
+}
+
+// Can this car put itself in that cell? A cell that is not a junction is never
+// reserved; a junction is free, or already ours.
+static bool city__claim_free(const city_traffic& t, const city_world& w,
+                             int x, int z, int self) {
+    if (!city__is_junction(w, x, z)) return true;
+    uint16_t owner = t.claim[(size_t)z * CITY_CELLS + x];
+    return owner == CAR_CLAIM_NONE || owner == (uint16_t)self;
+}
+
+static void city__claim_release(city_traffic& t, city_car& c) {
+    if (c.claim_x < 0) return;
+    size_t id = (size_t)c.claim_z * CITY_CELLS + c.claim_x;
+    if (t.claim[id] != CAR_CLAIM_NONE) t.claim[id] = CAR_CLAIM_NONE;
+    c.claim_x = c.claim_z = -1;
+}
+
+static void city__claim_take(city_traffic& t, city_car& c, int self, int x, int z) {
+    city__claim_release(t, c);
+    t.claim[(size_t)z * CITY_CELLS + x] = (uint16_t)self;
+    c.claim_x = x;
+    c.claim_z = z;
 }
 
 // Picks the cell a car should head to after `to`, coming from `from`.
@@ -106,6 +144,7 @@ static bool city__next_road(const city_world& w, rng& r, int from_x, int from_z,
     return true;
 }
 
+
 // The point a car aims at: the centre of its target cell, pushed to the right
 // hand lane so opposing traffic passes on the correct side.
 static vec3 city__lane_point(int from_x, int from_z, int to_x, int to_z) {
@@ -113,6 +152,24 @@ static vec3 city__lane_point(int from_x, int from_z, int to_x, int to_z) {
     vec3 right = dir_right(travel);
     vec3 centre = cell_centre(to_x, to_z, ROAD_SURFACE_Y);
     return v3add(centre, v3scale(right, ROAD_LANE_OFFSET));
+}
+
+// Where a car is really aiming. Steering at the centre of the very next cell
+// makes a car swing hard as it arrives and then hard back, which is most of
+// what the weaving looked like; aiming at a point carried on toward the cell
+// *after* it, weighted by how close the near one already is, is a pure pursuit
+// target and it takes a corner as one arc.
+static vec3 city__pursuit_point(const city_world& w, const city_car& c, float distance) {
+    vec3 near_point = city__lane_point(c.node_x, c.node_z, c.next_x, c.next_z);
+
+    int dx = c.next_x - c.node_x, dz = c.next_z - c.node_z;
+    int ax = c.next_x + dx, az = c.next_z + dz;
+    if (!city_is_road(w, ax, az)) return near_point;
+
+    vec3 far_point = city__lane_point(c.next_x, c.next_z, ax, az);
+    // fully on the near point a cell out, fully on the far one on arrival
+    float blend = clampf(1.0f - distance / (CITY_TILE * 0.9f), 0.0f, 0.65f);
+    return v3add(near_point, v3scale(v3sub(far_point, near_point), blend));
 }
 
 // is there already a vehicle close enough that spawning here would drop one
@@ -130,7 +187,7 @@ static bool city__road_occupied(const city_traffic& t, vec3 at, float clearance)
 static int city_traffic_spawn(city_traffic& t, const city_world& w, const city_catalog& cat,
                               phys_world& phys, int cx, int cz) {
     if (!cat.vehicle_count || !city_is_road(w, cx, cz)) return -1;
-    if (city__road_occupied(t, cell_centre(cx, cz), CITY_TILE * 1.6f)) return -1;
+    if (city__road_occupied(t, cell_centre(cx, cz), CITY_TILE * 2.2f)) return -1;
 
     int slot = -1;
     for (size_t i = 0; i < MAX_CARS; i++)
@@ -148,6 +205,7 @@ static int city_traffic_spawn(city_traffic& t, const city_world& w, const city_c
 
     city_car& c = t.cars[slot];
     memset(&c, 0, sizeof(c));
+    c.claim_x = c.claim_z = -1;
     c.model = (uint8_t)(rng_u32(t.random) % cat.vehicle_count);
     c.node_x = cx; c.node_z = cz;
     c.next_x = exits[chosen][0];
@@ -168,7 +226,9 @@ static int city_traffic_spawn(city_traffic& t, const city_world& w, const city_c
     b.half = v2(vm.half_width, vm.half_length);
     b.height = vm.height;
     b.inv_mass = 1.0f / 1200.0f;
-    b.restitution = 0.05f;
+    // Nothing about a car nudging another car should bounce. Any restitution at
+    // all turns a queue at a red light into a row of things jostling each other.
+    b.restitution = 0.0f;
     b.group = PHYS_LAYER_VEHICLE;
     b.collides = PHYS_LAYER_ALL;
     b.gravity = false;
@@ -181,6 +241,7 @@ static int city_traffic_spawn(city_traffic& t, const city_world& w, const city_c
 
 static void city__despawn(city_traffic& t, phys_world& phys, city_car& c) {
     if (!c.active) return;
+    city__claim_release(t, c);
     phys_remove_body(phys, c.body);
     c.active = false;
     if (t.count) t.count--;
@@ -189,14 +250,19 @@ static void city__despawn(city_traffic& t, phys_world& phys, city_car& c) {
 // How much of the road ahead is clear, in metres, capped at CAR_LOOKAHEAD.
 // Everything that can be in a car's way - other cars and people - is a body in
 // the physics world already, so one neighbourhood query answers both.
+//
+// The cone is measured along the direction the car is *travelling toward*, not
+// the way it currently points. Through a turn those differ by most of a right
+// angle, and a cone aimed down the old heading looks straight at the kerb while
+// the car it is about to run into sits outside it - which is exactly how a
+// queue of turning cars used to end up shunting each other round a corner.
 static float city__clear_ahead(const phys_world& phys, const city_car& self,
-                               const city_vehicle_model& vm) {
-    vec3 fwd = forward_from_yaw(self.yaw);
+                               const city_vehicle_model& vm, vec3 heading) {
     float reach = vm.half_length + CAR_LOOKAHEAD;
     float nearest = reach;
 
-    idx hits[48];
-    size_t n = phys_query_neighbours(phys, self.position, reach + 2.0f, hits, 48);
+    idx hits[64];
+    size_t n = phys_query_neighbours(phys, self.position, reach + 2.0f, hits, 64);
     for (size_t k = 0; k < n; k++) {
         idx i = hits[k];
         const phys_body& b = phys.bodies[i];
@@ -204,19 +270,23 @@ static float city__clear_ahead(const phys_world& phys, const city_car& self,
         if (!(b.group & (PHYS_LAYER_VEHICLE | PHYS_LAYER_PED | PHYS_LAYER_PLAYER))) continue;
 
         vec3 to = v3sub(b.position, self.position);
-        float along = to.x * fwd.x + to.z * fwd.z;
+        float along = to.x * heading.x + to.z * heading.z;
         if (along <= 0.0f || along > reach) continue;
-        // lateral gap, widened by the other body's own footprint
-        float side = fabsf(to.x * fwd.z - to.z * fwd.x);
-        float clearance = vm.half_width + (b.shape == PHYS_BOX ? b.half.x : b.radius) + 0.25f;
+        // Lateral gap, widened by the other body's own footprint - and widened
+        // again with distance, so a car far enough ahead to still be swinging
+        // through a bend is not missed by a cone that only looks straight.
+        float side = fabsf(to.x * heading.z - to.z * heading.x);
+        float clearance = vm.half_width + (b.shape == PHYS_BOX ? b.half.x : b.radius)
+                        + 0.25f + along * 0.16f;
         if (side > clearance) continue;
         if (along < nearest) nearest = along;
     }
     return nearest - vm.half_length;
 }
 
-static void city__drive_ai(city_car& c, city_world& w, const city_catalog& cat,
-                           phys_world& phys, rng& r, float time, float dt) {
+static void city__drive_ai(city_traffic& t, city_car& c, int self, city_world& w,
+                           const city_catalog& cat, phys_world& phys, rng& r,
+                           float time, float dt) {
     const city_vehicle_model& vm = cat.vehicles[c.model];
 
     // ---- navigation ----
@@ -230,39 +300,75 @@ static void city__drive_ai(city_car& c, city_world& w, const city_catalog& cat,
         if (city__next_road(w, r, c.node_x, c.node_z, c.next_x, c.next_z, &nx, &nz)) {
             c.node_x = c.next_x; c.node_z = c.next_z;
             c.next_x = nx;       c.next_z = nz;
-            target = city__lane_point(c.node_x, c.node_z, c.next_x, c.next_z);
-            to_target = v3sub(target, c.position);
-            to_target.y = 0.0f;
-            distance = v3len(to_target);
+            // the cell just left is no longer needed, whoever is queued behind
+            // can have it
+            if (c.claim_x >= 0 && (c.claim_x != c.node_x || c.claim_z != c.node_z)
+                && (c.claim_x != c.next_x || c.claim_z != c.next_z))
+                city__claim_release(t, c);
         }
     }
 
+    target = city__pursuit_point(w, c, distance);
+    to_target = v3sub(target, c.position);
+    to_target.y = 0.0f;
+    distance = v3len(to_target);
+
     // ---- steering ----
+    // Damped rather than set outright: the wheels of a real car take a moment
+    // to come round, and a steering angle that snaps to the heading error makes
+    // a car hunt from lock to lock down a straight road.
     float want_yaw = yaw_from_forward(v3norm(to_target));
     float turn = angle_delta(c.yaw, want_yaw);
-    c.steer = clampf(-turn * 1.6f, -1.0f, 1.0f);   // steer is +1 right, yaw grows left
+    c.steer = damp(c.steer, clampf(-turn * 1.5f, -1.0f, 1.0f), 9.0f, dt);
 
     // ---- speed ----
     float target_speed = CAR_MAX_SPEED * (1.0f - 0.45f * fabsf(c.steer));
 
-    // red light: stop at the mouth of the junction, not in the middle of it
+    // ---- the junction ahead ----
+    //
+    // Distance to the mouth of the next cell, which is where a car has to be
+    // able to stop: the lane point is in the middle of it, half a tile further.
     const city_cell& next_cell = city_at(w, c.next_x, c.next_z);
+    float to_next = v3len(v3sub(city__lane_point(c.node_x, c.node_z, c.next_x, c.next_z),
+                                c.position));
+    float stop_gap = to_next - CITY_TILE * 0.55f;
+    bool must_stop = false;
+
     if (next_cell.flags & CELLF_JUNCTION) {
         int axis = (c.next_x != c.node_x) ? 0 : 1;    // 0 = travelling along X
-        if (!traffic_axis_green(time, axis)) {
-            float stop_gap = distance - CITY_TILE * 0.55f;
-            if (stop_gap < 12.0f) {
-                float allowed = stop_gap > 0.5f ? stop_gap * 0.8f : 0.0f;
-                if (allowed < target_speed) target_speed = allowed;
-            }
-        }
+        if (!traffic_axis_green(time, axis)) must_stop = true;
+
+        if (!must_stop && !city__claim_free(t, w, c.next_x, c.next_z, self)) must_stop = true;
+
+        // Do not block the box: a car may only take the junction if the cell it
+        // means to leave by is somewhere it can also stand. Without this a car
+        // rolls into the middle of a crossing, stops behind the queue on the far
+        // side, and every other approach is dead until it moves.
+        if (!must_stop && !city__claim_free(t, w, c.next_x + (c.next_x - c.node_x),
+                                            c.next_z + (c.next_z - c.node_z), self))
+            must_stop = true;
+
+        // clear to go: take the box before anyone else does
+        if (!must_stop && stop_gap < CITY_TILE)
+            city__claim_take(t, c, self, c.next_x, c.next_z);
     }
 
-    // whatever is in front
-    float clear = city__clear_ahead(phys, c, vm);
+    if (must_stop && stop_gap < CAR_LOOKAHEAD) {
+        float allowed = stop_gap > 0.6f ? stop_gap * 0.9f : 0.0f;
+        if (allowed < target_speed) target_speed = allowed;
+    }
+
+    // whatever is in front, measured along the way the car is going
+    vec3 heading = distance > 1e-3f ? v3scale(to_target, 1.0f / distance)
+                                    : forward_from_yaw(c.yaw);
+    float clear = city__clear_ahead(phys, c, vm, heading);
     if (clear < CAR_LOOKAHEAD) {
-        float allowed = (clear - 1.6f) * 1.6f;
-        if (allowed < 0.0f) allowed = 0.0f;
+        // Stop with CAR_GAP still in hand, and approach that gap at a speed the
+        // brakes can actually shed - sqrt(2 a d) is the exact answer, and using
+        // it instead of a linear ramp is the difference between a queue that
+        // settles and one that keeps rear-ending itself.
+        float gap = clear - CAR_GAP;
+        float allowed = gap > 0.0f ? sqrtf(2.0f * CAR_BRAKE * 0.75f * gap) : 0.0f;
         if (allowed < target_speed) target_speed = allowed;
     }
 
@@ -272,8 +378,10 @@ static void city__drive_ai(city_car& c, city_world& w, const city_catalog& cat,
     c.brake_light = target_speed < c.speed - 0.5f ? 1.0f : 0.0f;
 
     // A car wedged against geometry gives up and is recycled elsewhere rather
-    // than sitting in the world forever blocking the lane behind it.
-    if (c.speed < 0.4f && target_speed > 2.0f) c.blocked_time += dt;
+    // than sitting in the world forever blocking the lane behind it. Waiting at
+    // a red light or behind a queue is not being wedged, so neither counts.
+    bool waiting = must_stop || clear < CAR_LOOKAHEAD;
+    if (c.speed < 0.4f && !waiting) c.blocked_time += dt;
     else c.blocked_time = 0.0f;
 }
 
@@ -325,9 +433,18 @@ static void city_traffic_update(city_traffic& t, city_world& w, const city_catal
             city__despawn(t, phys, c);
             continue;
         }
-        if (c.player_driven) continue;      // the player's own car is driven elsewhere
+        if (c.player_driven) {
+            // The player still has to take a junction off the queue, or the AI
+            // will drive through the box the player is sitting in.
+            if (city__is_junction(w, world_to_cell(c.position.x), world_to_cell(c.position.z)))
+                city__claim_take(t, c, (int)i, world_to_cell(c.position.x),
+                                 world_to_cell(c.position.z));
+            else
+                city__claim_release(t, c);
+            continue;
+        }
 
-        city__drive_ai(c, w, cat, phys, t.random, time, dt);
+        city__drive_ai(t, c, (int)i, w, cat, phys, t.random, time, dt);
         city__integrate_car(c, cat.vehicles[c.model], phys, dt);
     }
 
@@ -343,6 +460,9 @@ static void city_traffic_update(city_traffic& t, city_world& w, const city_catal
             float dx = p.x - focus.x, dz = p.z - focus.z;
             float d = sqrtf(dx * dx + dz * dz);
             if (d < 55.0f || d > CAR_SPAWN_RADIUS) continue;
+            // never drop a car into a junction box: it would arrive with no
+            // claim on a cell it is already standing in
+            if (city_at(w, cx, cz).flags & CELLF_JUNCTION) continue;
             city_traffic_spawn(t, w, cat, phys, cx, cz);
         }
     }

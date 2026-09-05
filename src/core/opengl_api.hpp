@@ -75,6 +75,8 @@ typedef void  (APIENTRY* PFN_glUniform3f)(GLint, GLfloat, GLfloat, GLfloat);
 typedef void  (APIENTRY* PFN_glUniform1i)(GLint, GLint);
 typedef void  (APIENTRY* PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void  (APIENTRY* PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
+// arrays: a frame's punctual lights go up as three of these
+typedef void  (APIENTRY* PFN_glUniform4fv)(GLint, GLsizei, const GLfloat*);
 typedef void  (APIENTRY* PFN_glUniform1f)(GLint, GLfloat);
 typedef void  (APIENTRY* PFN_glDrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei);
 typedef void  (APIENTRY* PFN_glGenFramebuffers)(GLsizei, GLuint*);
@@ -101,6 +103,7 @@ typedef void  (APIENTRY* PFN_glDeleteVertexArrays)(GLsizei, const GLuint*);
     E(glDrawArraysInstanced) \
     E(glActiveTexture) E(glGenerateMipmap) E(glGetUniformLocation) \
     E(glUniformMatrix4fv) E(glUniform3f) E(glUniform1i) E(glUniform2f) E(glUniform4f) E(glUniform1f) \
+    E(glUniform4fv) \
     E(glGenFramebuffers) E(glBindFramebuffer) E(glDeleteFramebuffers) E(glFramebufferTexture2D) \
     E(glCheckFramebufferStatus) E(glGenRenderbuffers) E(glBindRenderbuffer) \
     E(glDeleteRenderbuffers) E(glRenderbufferStorage) E(glFramebufferRenderbuffer) \

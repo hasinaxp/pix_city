@@ -16,6 +16,7 @@
 // "pick a random one of these" a single modulo.
 
 #define CITY_MAX_MODELS 400
+#define CITY_GRASS_SHADES 4
 
 // asset roots
 #define KAY_DIR    "assets/city/kaykit/"
@@ -33,7 +34,7 @@
 // than a texture. The glTF loader merges the meshes and bakes those colours
 // into a palette image, so a whole character is one skinned draw.
 #define CITY_MAX_CHARACTERS 4
-#define CITY_MAX_CHAR_TINTS 5
+#define CITY_MAX_CHAR_TINTS 12
 
 // The clips the game asks for by role. A rig that does not ship one falls back
 // to the next best thing it does have (see CLIP_NAMES), so a character with a
@@ -63,7 +64,8 @@ struct city_character {
 enum city_set {
     SET_ROAD,          // straight, corner, tsplit, junction, crossing, curved corner
     SET_BUILDING,      // KayKit's building_A..H - every occupied lot, any zone
-    SET_YARD,          // fences, paths, driveways, planters
+    SET_YARD,          // fences and planters
+    SET_PAVING,        // garden paths and driveways, flat on the ground
     SET_STREET,        // lamps, lights, bins, hydrants, benches, boxes
     SET_TREE_STREET,   // narrow enough to stand on a pavement
     SET_TREE_PARK,     // anything goes
@@ -81,7 +83,8 @@ enum city_single {
     ONE_ROAD_STRAIGHT, ONE_ROAD_CORNER, ONE_ROAD_TSPLIT, ONE_ROAD_JUNCTION,
     ONE_ROAD_CROSSING, ONE_ROAD_CORNER_CURVED,
     ONE_STREETLIGHT, ONE_TRAFFICLIGHT, ONE_BENCH, ONE_HYDRANT, ONE_BIN, ONE_DUMPSTER,
-    ONE_QUAD, ONE_SLAB, ONE_BRIDGE, ONE_PIER,
+    ONE_FENCE, ONE_PATH, ONE_DRIVEWAY,
+    ONE_QUAD, ONE_SLAB, ONE_BRIDGE, ONE_PIER, ONE_WATER_TILE,
     ONE_COUNT
 };
 
@@ -133,6 +136,9 @@ struct city_catalog {
 
     city_set_range sets[SET_COUNT];
     idx            singles[ONE_COUNT];
+    // SET_BUILDING holds every building once per facade colour, facade-major:
+    // model = sets[SET_BUILDING].first + facade * building_kinds + kind
+    idx            building_kinds;
 
     city_vehicle_model vehicles[CITY_MAX_VEHICLES];
     size_t             vehicle_count;
@@ -140,6 +146,9 @@ struct city_catalog {
     // materials
     idx mat_city, mat_suburban, mat_vehicle, mat_rail, mat_palette;
     idx mat_grass, mat_concrete, mat_asphalt, mat_dirt, mat_water, mat_horizon;
+    idx mat_riverbed, mat_stone;
+    // a few shades of the same green so a field of grass cells is not one flat sheet
+    idx mat_grass_shades[CITY_GRASS_SHADES];
     // Same citybits atlas, a few shades apart. Real streets are not built out of
     // one batch of concrete, and one tint per building breaks the repetition
     // without reintroducing the primary-coloured blocks.
@@ -217,6 +226,187 @@ static void city__extend_set(city_catalog& cat, pix_data_loader& loader, pix_ren
     }
 }
 
+// A model plus the size it should be in the world, in metres along its longest
+// axis.
+//
+// One scale factor per kit only works where the kit is internally consistent,
+// and the Kenney nature kit is not: inside a single folder a tree is 1.7 units
+// tall and a tuft of grass is 0.25, so any factor that makes the trees right
+// makes the undergrowth into shrubs the size of cars - which is exactly what
+// "the foliage looks off at any scale" is. Sizing each model against its own
+// measured bounds is the only thing that fixes it, and it also means adding a
+// model to a table is stating how big the thing is rather than guessing a
+// multiplier.
+struct city_kit_item {
+    const char* name;
+    float       size;   // metres, longest axis
+};
+
+static idx city__add_model_sized(city_catalog& cat, pix_data_loader& loader,
+                                 pix_renderer& renderer, const char* dir,
+                                 const city_kit_item& item, idx material) {
+    idx id = city__add_model(cat, loader, renderer, dir, item.name, material, 1.0f);
+    if (id == (idx)-1) return id;
+    city_model& m = cat.models[id];
+    vec3 e = v3sub(m.bounds_max, m.bounds_min);
+    float longest = e.x > e.y ? (e.x > e.z ? e.x : e.z) : (e.y > e.z ? e.y : e.z);
+    m.scale = longest > 1e-4f ? item.size / longest : 1.0f;
+    return id;
+}
+
+static void city__add_set_sized(city_catalog& cat, pix_data_loader& loader, pix_renderer& renderer,
+                                int set, const char* dir, const city_kit_item* items, int count,
+                                idx material) {
+    cat.sets[set].first = (idx)cat.model_count;
+    cat.sets[set].count = 0;
+    for (int i = 0; i < count; i++)
+        if (city__add_model_sized(cat, loader, renderer, dir, items[i], material) != (idx)-1)
+            cat.sets[set].count++;
+}
+
+static void city__extend_set_sized(city_catalog& cat, pix_data_loader& loader,
+                                   pix_renderer& renderer, int set, const char* dir,
+                                   const city_kit_item* items, int count, idx material) {
+    if (!cat.sets[set].count) cat.sets[set].first = (idx)cat.model_count;
+    for (int i = 0; i < count; i++)
+        if (city__add_model_sized(cat, loader, renderer, dir, items[i], material) != (idx)-1)
+            cat.sets[set].count++;
+}
+
+// ---- building facades ----
+//
+// KayKit paints every building out of the citybits atlas, and the atlas is an
+// 8 x 4 grid of swatches, each swatch a vertical lightness gradient (that
+// gradient is the baked shading and window detail, and it is the only thing
+// making the flat geometry read as architecture).
+//
+// The trouble is which swatches a single building reaches for. Measured off the
+// meshes - area of the vertical faces only, so slabs and roofs are excluded -
+// every one of the eight buildings paints its walls out of *two or three*
+// different swatches stacked by height:
+//
+//   building_A   steel blue   y 0.10-0.90   +  slate      y 0.90-1.55
+//   building_D   brown        y 0.90-2.25   +  tan        y 0.10-2.41
+//   building_H   slate        y 0.10-2.95   +  sandstone  y 0.10-2.25
+//
+// which is why a building reads as a stack of differently coloured blocks
+// rather than as one building. The nine swatches below are the kit's whole
+// wall palette (no swatch in it is used for anything but walls in any
+// meaningful quantity); collapsing all nine onto one target swatch gives a
+// building a single facade material while leaving the concrete slabs, the
+// white window trim and the small accent details exactly where they were.
+//
+// Variety then comes from loading each building once per target swatch and
+// letting the generator pick, which is real variety between buildings instead
+// of stripes within one.
+#define ATLAS_COLS 8
+#define ATLAS_ROWS 4    // swatch rows; each is two atlas cells tall
+
+struct atlas_swatch { int row, col; };
+
+// every swatch the eight buildings use on a vertical face
+static const atlas_swatch BUILDING_WALL_SWATCHES[] = {
+    { 0, 5 }, { 0, 7 }, { 1, 0 }, { 1, 2 }, { 1, 3 },
+    { 1, 5 }, { 2, 2 }, { 2, 3 }, { 2, 7 }
+};
+#define BUILDING_WALL_SWATCH_COUNT 9
+
+// The facades a city gets built out of, in the graded atlas: slate, sandstone,
+// brick brown, terracotta and a pale blue-grey. Ordered so the first two read
+// as commercial and the last three as residential - the generator leans on that.
+static const atlas_swatch BUILDING_FACADES[] = {
+    { 1, 2 },   // slate grey-blue
+    { 1, 0 },   // pale blue-grey
+    { 1, 3 },   // sandstone
+    { 2, 2 },   // brick brown
+    { 2, 7 }    // terracotta
+};
+#define BUILDING_FACADE_COUNT 5
+
+// Moves a uv from whichever wall swatch it is in onto `to`, keeping its
+// position *inside* the swatch - which is what preserves the baked gradient,
+// and also means the uv stays exactly as far from the swatch edge as it was, so
+// no new texel bleeding is introduced.
+//
+// OBJ v is bottom-origin and the vertex shader flips it, so the atlas row a uv
+// lands in is measured from 1 - v.
+static vec2 city__reswatch_uv(vec2 uv, atlas_swatch to) {
+    float u = uv.x * ATLAS_COLS;
+    float v = (1.0f - uv.y) * ATLAS_ROWS;
+    int col = (int)floorf(u), row = (int)floorf(v);
+    float fu = u - (float)col, fv = v - (float)row;
+    if (col < 0) col = 0; else if (col >= ATLAS_COLS) col = ATLAS_COLS - 1;
+    if (row < 0) row = 0; else if (row >= ATLAS_ROWS) row = ATLAS_ROWS - 1;
+
+    bool wall = false;
+    for (int i = 0; i < BUILDING_WALL_SWATCH_COUNT; i++)
+        if (BUILDING_WALL_SWATCHES[i].row == row && BUILDING_WALL_SWATCHES[i].col == col)
+            wall = true;
+    if (!wall) return uv;
+
+    return v2(((float)to.col + fu) / ATLAS_COLS,
+              1.0f - ((float)to.row + fv) / ATLAS_ROWS);
+}
+
+// Loads building_A..H once per facade colour, laid out facade-major so a model
+// is addressed as first + facade * building_kinds + kind.
+//
+// Each .obj is parsed once and its authored uvs kept aside; every facade then
+// rewrites from that original rather than from what the previous one left
+// behind, and only the vertex upload is repeated.
+#define CITY_MAX_BUILDING_KINDS 8
+
+static void city__add_buildings(city_catalog& cat, pix_data_loader& loader,
+                                pix_renderer& renderer, const char* const* names, int count) {
+    if (count > CITY_MAX_BUILDING_KINDS) count = CITY_MAX_BUILDING_KINDS;
+    static vec2 original[CITY_MAX_BUILDING_KINDS][8192];
+    idx file[CITY_MAX_BUILDING_KINDS];
+    int kinds = 0;
+
+    for (int i = 0; i < count; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s%s.obj", KAY_DIR, names[i]);
+        idx f = load_mesh_obj_file(loader, path);
+        if (f == (idx)-1) continue;
+        const mesh_file_data& md = loader.mesh_files[f];
+        if (md.vertex_count > 8192) continue;          // no room to keep its uvs
+        for (size_t k = 0; k < md.vertex_count; k++) original[kinds][k] = md.vertex_data[k].uv;
+        file[kinds++] = f;
+    }
+
+    cat.sets[SET_BUILDING].first = (idx)cat.model_count;
+    cat.sets[SET_BUILDING].count = 0;
+    cat.building_kinds = (idx)kinds;
+
+    for (int f = 0; f < BUILDING_FACADE_COUNT; f++)
+        for (int i = 0; i < kinds; i++) {
+            if (cat.model_count >= CITY_MAX_MODELS) return;
+            mesh_file_data& md = loader.mesh_files[file[i]];
+            for (size_t k = 0; k < md.vertex_count; k++)
+                md.vertex_data[k].uv = city__reswatch_uv(original[i][k], BUILDING_FACADES[f]);
+
+            idx mesh = load_mesh(renderer, md);
+            if (mesh == (idx)-1) { cat.building_kinds = 0; return; }   // pool full: no set at all
+
+            city_model& m = cat.models[cat.model_count++];
+            m.mesh = mesh;
+            m.material = cat.mat_city;
+            m.bounds_min = md.bounds_min;
+            m.bounds_max = md.bounds_max;
+            m.scale = KIT_ROAD_SCALE;
+            cat.sets[SET_BUILDING].count++;
+        }
+}
+
+// the model for one building kind wearing one facade colour
+static const city_model* city_building(const city_catalog& cat, int facade, int kind) {
+    if (!cat.building_kinds) return 0;
+    facade %= BUILDING_FACADE_COUNT;
+    kind %= (int)cat.building_kinds;
+    idx id = cat.sets[SET_BUILDING].first + (idx)facade * cat.building_kinds + (idx)kind;
+    return id < cat.model_count ? &cat.models[id] : 0;
+}
+
 // ---- generated geometry ----
 
 // a flat unit quad in XZ, so one mesh scaled by a plain material colour covers
@@ -235,6 +425,44 @@ static idx city__make_quad(pix_renderer& renderer) {
     mesh_file_data md = {};
     md.vertex_count = 4; md.vertex_data = verts;
     md.index_count = 6;  md.index_data = inds;
+    return load_mesh(renderer, md);
+}
+
+// The water surface tile: the same unit quad, but subdivided, because the wave
+// shader displaces its vertices. Four corners can only ever be a flat plane no
+// matter what the fragment shader draws on it, and a flat plane is the single
+// thing that stops water reading as water - a surface that does not move
+// against the horizon is a painted floor. The wave field is a function of world
+// position, so neighbouring tiles agree along their shared edge exactly and the
+// river comes out as one continuous surface.
+#define WATER_TILE_DIV 6
+
+static idx city__make_water_tile(pix_renderer& renderer) {
+    static vertex verts[(WATER_TILE_DIV + 1) * (WATER_TILE_DIV + 1)];
+    static uint16_t inds[WATER_TILE_DIV * WATER_TILE_DIV * 6];
+    int v = 0;
+    for (int z = 0; z <= WATER_TILE_DIV; z++)
+        for (int x = 0; x <= WATER_TILE_DIV; x++) {
+            float u = (float)x / (float)WATER_TILE_DIV;
+            float w = (float)z / (float)WATER_TILE_DIV;
+            verts[v].position = v3(u - 0.5f, 0.0f, w - 0.5f);
+            verts[v].normal = v3(0.0f, 1.0f, 0.0f);
+            verts[v].uv = v2(u, w);
+            v++;
+        }
+    int i = 0;
+    for (int z = 0; z < WATER_TILE_DIV; z++)
+        for (int x = 0; x < WATER_TILE_DIV; x++) {
+            uint16_t a = (uint16_t)(z * (WATER_TILE_DIV + 1) + x);
+            uint16_t b = (uint16_t)(a + 1);
+            uint16_t c = (uint16_t)(a + WATER_TILE_DIV + 1);
+            uint16_t d = (uint16_t)(c + 1);
+            inds[i++] = a; inds[i++] = c; inds[i++] = d;
+            inds[i++] = a; inds[i++] = d; inds[i++] = b;
+        }
+    mesh_file_data md = {};
+    md.vertex_count = (size_t)v; md.vertex_data = verts;
+    md.index_count = (size_t)i;  md.index_data = inds;
     return load_mesh(renderer, md);
 }
 
@@ -405,18 +633,41 @@ static const char* const CLIP_NAMES[CLIP_COUNT][4] = {
     /* IDLE */ { "Idle", "Idle_Neutral", "Standing", 0 },
     /* WALK */ { "Walk", "Run", 0, 0 },
     /* RUN  */ { "Run", "Walk", 0, 0 },
-    /* JUMP */ { "Jump", "RunningJump", "Roll", 0 },
+    // No fallback for JUMP. Three of the four rigs ship no jump at all, and
+    // the nearest thing they do have is a combat roll - which, played on a
+    // loop for the length of a hop, is far worse than leaving the clip
+    // unresolved and letting the player keep its locomotion pose. The player
+    // deliberately picks a rig that does have one; see city_pick_player.
+    /* JUMP */ { "Jump", "RunningJump", 0, 0 },
     /* WAVE */ { "Wave", "Clapping", "Interact", 0 },
     /* TALK */ { "Idle_Neutral", "Standing", "Interact", "Idle" },
     /* SIT  */ { "Sitting", "Idle", 0, 0 },
 };
 
 // Outfit tints. These multiply the rig's own palette rather than replacing it,
-// so a character keeps its authored skin and hair while its clothes shift -
-// a flat recolour of the whole model reads as a painted statue.
+// so a character keeps its authored skin and hair while its clothes shift - a
+// flat recolour of the whole model reads as a painted statue.
+//
+// Four rigs is not many to build a crowd out of, and the thing that gives a
+// crowd away is not the number of faces, it is seeing the same silhouette in
+// the same colour twice within a few metres. Twelve tints across four rigs is
+// forty-eight visibly different people, and each one is a material clone over
+// a texture that was already uploaded, so the whole set costs nothing but
+// material slots. They stay near 1 in brightness and spread in hue instead,
+// because a tint far from 1 darkens the skin along with the clothes.
 static const vec3 CHAR_TINTS[CITY_MAX_CHAR_TINTS] = {
-    { 1.00f, 1.00f, 1.00f }, { 0.86f, 0.90f, 1.00f }, { 1.00f, 0.92f, 0.86f },
-    { 0.90f, 1.00f, 0.92f }, { 1.04f, 0.98f, 0.88f }
+    { 1.00f, 1.00f, 1.00f },   // as authored
+    { 0.82f, 0.88f, 1.05f },   // cool blue
+    { 1.06f, 0.90f, 0.82f },   // warm rust
+    { 0.86f, 1.02f, 0.90f },   // sage
+    { 1.06f, 1.00f, 0.84f },   // sand
+    { 0.94f, 0.86f, 1.04f },   // violet
+    { 1.02f, 0.82f, 0.88f },   // dusty rose
+    { 0.80f, 0.94f, 0.98f },   // slate
+    { 0.90f, 0.90f, 0.90f },   // muted
+    { 1.08f, 1.04f, 0.96f },   // bright
+    { 0.86f, 0.82f, 0.78f },   // dark work clothes
+    { 0.98f, 1.06f, 1.02f }    // pale mint
 };
 
 // Fills one animator with every clip a rig ships, in export order - which is
@@ -478,6 +729,16 @@ static bool city__load_character(city_character& ch, pix_data_loader& loader,
 
     ch.ok = true;
     return true;
+}
+
+// Which rig the player gets. Only one of the four ships a real Jump clip (and
+// the same one is the only one with a Sitting pose for being behind a wheel),
+// so the player takes whichever rig is actually equipped for what the player
+// can do; the crowd keeps using all of them.
+static idx city_pick_player(const city_catalog& cat) {
+    for (size_t i = 0; i < cat.character_count; i++)
+        if (cat.characters[i].ok && cat.characters[i].clips[CLIP_JUMP] != (idx)-1) return (idx)i;
+    return cat.character_count ? 0 : (idx)-1;
 }
 
 // ---- vehicles ----
@@ -598,10 +859,28 @@ static bool city_load_catalog(city_catalog& cat, pix_data_loader& loader, pix_re
     // filled in at the bottom of this function.
     cat.mat_palette    = load_material(renderer, 0, v3(1,1,1), 0.0f, 0.9f);
 
-    cat.mat_grass    = load_material(renderer, 0, v3(0.31f, 0.47f, 0.24f), 0.0f, 1.0f);
+    // Ground. One flat green over a whole district is the other half of "the
+    // grass looks off": real turf is never one colour, and at this cell size a
+    // single tint turns every park and verge into a billiard table. Four shades
+    // of the same green, handed out per cell by a hash of its coordinates, cost
+    // three extra materials and break the sheet up without patterning.
+    static const vec3 GRASS_SHADES[CITY_GRASS_SHADES] = {
+        { 0.29f, 0.42f, 0.21f }, { 0.33f, 0.46f, 0.23f },
+        { 0.26f, 0.38f, 0.20f }, { 0.35f, 0.45f, 0.26f }
+    };
+    for (int i = 0; i < CITY_GRASS_SHADES; i++)
+        cat.mat_grass_shades[i] = load_material(renderer, 0, GRASS_SHADES[i], 0.0f, 1.0f);
+    cat.mat_grass    = cat.mat_grass_shades[0];
     cat.mat_concrete = load_material(renderer, 0, v3(0.58f, 0.57f, 0.54f), 0.0f, 0.88f);
-    cat.mat_asphalt  = load_material(renderer, 0, v3(0.19f, 0.19f, 0.21f), 0.0f, 0.82f);
-    cat.mat_dirt     = load_material(renderer, 0, v3(0.52f, 0.42f, 0.30f), 0.0f, 1.0f);
+    // yards, car parks and service ground behind the shops
+    cat.mat_asphalt  = load_material(renderer, 0, v3(0.30f, 0.30f, 0.31f), 0.0f, 0.90f);
+    // the retaining wall the embankment is built out of
+    cat.mat_stone    = load_material(renderer, 0, v3(0.44f, 0.43f, 0.40f), 0.0f, 0.92f);
+    cat.mat_dirt     = load_material(renderer, 0, v3(0.32f, 0.28f, 0.22f), 0.0f, 1.0f);
+    // The riverbed the water is seen through: dark and desaturated, because a
+    // bright bed under a translucent surface is what makes shallow water read
+    // as blue paint on mud instead of as depth.
+    cat.mat_riverbed = load_material(renderer, 0, v3(0.14f, 0.16f, 0.13f), 0.0f, 1.0f);
     cat.mat_water    = load_material(renderer, 0, v3(0.22f, 0.42f, 0.58f), 0.3f, 0.2f);
     // sits under the whole map; muted so the horizon reads as haze rather than
     // as a hard edge where the per-cell ground stops
@@ -646,75 +925,121 @@ static bool city_load_catalog(city_catalog& cat, pix_data_loader& loader, pix_re
         "building_A", "building_B", "building_C", "building_D",
         "building_E", "building_F", "building_G", "building_H"
     };
-    city__add_set(cat, loader, renderer, SET_BUILDING, KAY_DIR, BUILDINGS, 8,
-                  cat.mat_city, KIT_ROAD_SCALE);
+    city__add_buildings(cat, loader, renderer, BUILDINGS, 8);
 
     // ---- Kenney suburban: yard dressing only, not buildings ----
-    static const char* YARD[] = {
-        "fence", "fence-low", "fence-1x2", "fence-1x3", "fence-1x4",
-        "fence-2x2", "fence-2x3", "fence-3x2", "fence-3x3",
-        "path-long", "path-short", "path-stones-long", "path-stones-short",
-        "path-stones-messy", "driveway-long", "driveway-short", "planter"
+    // Yard dressing. Paths and driveways come out right at the kit's own scale
+    // (a path tile is 2 x 4 m, a drive 3.6 x 4 m), but the fences do not: at
+    // that scale a garden fence is 2.7 m tall, taller than the house it belongs
+    // to. Sizing them by length instead puts one cell's worth of fence at a
+    // believable 1.7 m high.
+    static const city_kit_item YARD[] = {
+        { "fence-1x3",         CITY_TILE }, { "fence-1x4",        CITY_TILE * 1.5f },
+        { "fence-2x3",         CITY_TILE }, { "planter",                     3.2f }
     };
-    city__add_set(cat, loader, renderer, SET_YARD, SUB_DIR, YARD, 17,
-                  cat.mat_suburban, KIT_BUILDING_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_YARD, SUB_DIR, YARD, 4, cat.mat_suburban);
+    if (cat.sets[SET_YARD].count) cat.singles[ONE_FENCE] = cat.sets[SET_YARD].first;
 
-    static const char* SUB_TREES[] = { "tree-large", "tree-small" };
-    city__add_set(cat, loader, renderer, SET_TREE_STREET, SUB_DIR, SUB_TREES, 2,
+    static const char* PAVING[] = {
+        "path-long", "path-stones-long", "path-stones-messy", "driveway-long"
+    };
+    city__add_set(cat, loader, renderer, SET_PAVING, SUB_DIR, PAVING, 4,
                   cat.mat_suburban, KIT_BUILDING_SCALE);
+    if (cat.sets[SET_PAVING].count >= 4) {
+        cat.singles[ONE_PATH]     = cat.sets[SET_PAVING].first;
+        cat.singles[ONE_DRIVEWAY] = cat.sets[SET_PAVING].first + 3;
+    }
+
+    // ---- greenery ----
+    //
+    // Every entry below states how big the thing is in metres along its longest
+    // axis, and the loader derives the scale from the model's own bounds. The
+    // nature kit ranges from a 1.7 unit tree to a 0.14 unit tuft of grass in the
+    // same folder, so no single per-kit multiplier can be right for both: the
+    // one that sized the trees was making tufts of grass waist high and garden
+    // bushes the size of cars. These are ordinary real-world sizes - a street
+    // tree is 7-8 m, a garden bush is knee to waist high, grass is ankle high.
+    static const city_kit_item SUB_TREES[] = { { "tree-large", 7.0f }, { "tree-small", 5.5f } };
+    city__add_set_sized(cat, loader, renderer, SET_TREE_STREET, SUB_DIR, SUB_TREES, 2,
+                        cat.mat_suburban);
 
     // ---- Kenney nature (no texture; its .mtl colours go through the palette) ----
-    static const char* STREET_TREES[] = {
-        "tree_thin", "tree_small", "tree_simple", "tree_cone", "tree_tall", "tree_plateau"
+    // Street trees are the narrow ones - a wide canopy on a 2 m verge overhangs
+    // the carriageway and reads as a wood the street was cut through.
+    static const city_kit_item STREET_TREES[] = {
+        { "tree_thin",    7.5f }, { "tree_small",   5.5f }, { "tree_simple",  7.0f },
+        { "tree_cone",    6.5f }, { "tree_tall",    8.5f }, { "tree_plateau", 6.0f }
     };
-    city__extend_set(cat, loader, renderer, SET_TREE_STREET, NAT_DIR, STREET_TREES, 6,
-                     cat.mat_palette, KIT_NATURE_SCALE);
+    city__extend_set_sized(cat, loader, renderer, SET_TREE_STREET, NAT_DIR, STREET_TREES, 6,
+                           cat.mat_palette);
 
-    static const char* PARK_TREES[] = {
-        "tree_default", "tree_oak", "tree_detailed", "tree_fat", "tree_blocks",
-        "tree_pineDefaultA", "tree_pineTallA", "tree_pineRoundC", "tree_pineSmallB",
-        "tree_default_fall", "tree_oak_fall", "tree_detailed_dark", "tree_tall_dark",
-        "tree_palmTall", "tree_palmDetailedShort"
+    // Palms and the autumn variants are gone: one palm in a temperate street of
+    // pines is the loudest wrong note in the whole set, and a park of
+    // half-turned trees beside a park of green ones reads as two seasons at
+    // once rather than as variety.
+    static const city_kit_item PARK_TREES[] = {
+        { "tree_default",      9.0f }, { "tree_oak",           8.0f },
+        { "tree_detailed",     8.5f }, { "tree_fat",           7.0f },
+        { "tree_blocks",       7.5f }, { "tree_pineDefaultA", 10.0f },
+        { "tree_pineTallA",   11.0f }, { "tree_pineRoundC",    8.0f },
+        { "tree_pineSmallB",   6.0f }, { "tree_detailed_dark", 8.5f },
+        { "tree_tall_dark",    9.5f }
     };
-    city__add_set(cat, loader, renderer, SET_TREE_PARK, NAT_DIR, PARK_TREES, 15,
-                  cat.mat_palette, KIT_NATURE_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_TREE_PARK, NAT_DIR, PARK_TREES, 11,
+                        cat.mat_palette);
 
-    static const char* SHRUBS[] = {
-        "plant_bush", "plant_bushDetailed", "plant_bushLarge", "plant_bushSmall",
-        "plant_bushTriangle", "grass", "grass_large", "grass_leafs",
-        "flower_redA", "flower_yellowB", "flower_purpleC", "mushroom_redGroup",
-        "crops_leafsStageB", "plant_flatTall"
+    // grass_leafs, plant_flatTall and crops_leafsStageB are modelled as a couple
+    // of flat crossed planes, which at any size reads as a green arrow stuck in
+    // the ground rather than as a plant. Everything left here has real volume.
+    static const city_kit_item SHRUBS[] = {
+        { "plant_bush",         1.4f }, { "plant_bushDetailed", 1.7f },
+        { "plant_bushLarge",    1.5f }, { "plant_bushSmall",    1.0f },
+        { "plant_bushTriangle", 1.2f }, { "grass",              0.8f },
+        { "grass_large",        1.0f }, { "flower_redA",        0.5f },
+        { "flower_yellowB",     0.4f }, { "flower_purpleC",     0.4f },
+        { "mushroom_redGroup",  0.3f }
     };
-    city__add_set(cat, loader, renderer, SET_SHRUB, NAT_DIR, SHRUBS, 14,
-                  cat.mat_palette, KIT_NATURE_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_SHRUB, NAT_DIR, SHRUBS, 11,
+                        cat.mat_palette);
 
-    static const char* ROCKS[] = {
-        "rock_smallA", "rock_smallC", "rock_largeB", "rock_tallD",
-        "stone_smallB", "stone_largeE", "log", "log_stack", "stump_round", "stump_squareDetailed"
+    static const city_kit_item ROCKS[] = {
+        { "rock_smallA",  1.1f }, { "rock_smallC",          0.9f },
+        { "rock_largeB",  2.6f }, { "rock_tallD",           2.0f },
+        { "stone_smallB", 1.0f }, { "stone_largeE",         2.8f },
+        { "log",          2.2f }, { "log_stack",            2.4f },
+        { "stump_round",  1.1f }, { "stump_squareDetailed", 1.3f }
     };
-    city__add_set(cat, loader, renderer, SET_ROCK, NAT_DIR, ROCKS, 10,
-                  cat.mat_palette, KIT_NATURE_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_ROCK, NAT_DIR, ROCKS, 10, cat.mat_palette);
 
-    static const char* FEATURES[] = {
-        "statue_column", "statue_obelisk", "statue_ring", "statue_block",
-        "pot_large", "pot_small", "campfire_stones", "sign", "path_stoneCircle",
-        "tent_smallClosed", "canoe", "lily_large"
+    static const city_kit_item FEATURES[] = {
+        { "statue_column",    4.0f }, { "statue_obelisk",   3.6f },
+        { "statue_ring",      2.8f }, { "statue_block",     1.6f },
+        { "pot_large",        1.4f }, { "pot_small",        1.0f },
+        { "campfire_stones",  1.5f }, { "sign",             1.8f },
+        { "path_stoneCircle", 2.6f }, { "tent_smallClosed", 2.4f },
+        { "canoe",            4.2f }, { "lily_large",       0.9f }
     };
-    city__add_set(cat, loader, renderer, SET_PARK_FEATURE, NAT_DIR, FEATURES, 12,
-                  cat.mat_palette, KIT_NATURE_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_PARK_FEATURE, NAT_DIR, FEATURES, 12,
+                        cat.mat_palette);
 
     // ---- Kenney rail: a freight line along the city's edge ----
-    static const char* RAILROAD[] = { "railroad-straight", "railroad-corner-large" };
-    city__add_set(cat, loader, renderer, SET_RAILROAD, RAIL_DIR, RAILROAD, 2,
-                  cat.mat_rail, KIT_RAIL_SCALE);
-
-    static const char* TRAIN[] = {
-        "train-locomotive-a", "train-carriage-box", "train-carriage-container-red",
-        "train-carriage-container-blue", "train-carriage-tank", "train-carriage-lumber",
-        "train-carriage-flatbed", "train-carriage-coal"
+    // Track is sized so one tile is exactly one cell, which is what lets the
+    // line be laid a cell at a time with no gaps and no overlap.
+    static const city_kit_item RAILROAD[] = {
+        { "railroad-straight", CITY_TILE }, { "railroad-corner-large", CITY_TILE }
     };
-    city__add_set(cat, loader, renderer, SET_TRAIN, RAIL_DIR, TRAIN, 8,
-                  cat.mat_rail, KIT_RAIL_SCALE);
+    city__add_set_sized(cat, loader, renderer, SET_RAILROAD, RAIL_DIR, RAILROAD, 2,
+                        cat.mat_rail);
+
+    // Rolling stock by width rather than length: the kit's carriages are short
+    // and fat, and sizing them by length gives a six metre wide boxcar.
+    static const city_kit_item TRAIN[] = {
+        { "train-locomotive-a",           7.4f }, { "train-carriage-box",            7.0f },
+        { "train-carriage-container-red", 7.0f }, { "train-carriage-container-blue", 7.0f },
+        { "train-carriage-tank",          7.0f }, { "train-carriage-lumber",         7.0f },
+        { "train-carriage-flatbed",       7.0f }, { "train-carriage-coal",           7.0f }
+    };
+    city__add_set_sized(cat, loader, renderer, SET_TRAIN, RAIL_DIR, TRAIN, 8, cat.mat_rail);
 
     // ---- vehicles ----
     static const char* CARS[] = {
@@ -729,6 +1054,8 @@ static bool city_load_catalog(city_catalog& cat, pix_data_loader& loader, pix_re
     idx slab = city__make_slab(renderer);
     cat.singles[ONE_QUAD] = city__register_generated(cat, quad, cat.mat_grass);
     cat.singles[ONE_SLAB] = city__register_generated(cat, slab, cat.mat_concrete);
+    cat.singles[ONE_WATER_TILE] =
+        city__register_generated(cat, city__make_water_tile(renderer), cat.mat_water);
     // a bridge deck and its piers are the same unit box, stretched
     cat.singles[ONE_BRIDGE] = city__register_generated(cat, slab, cat.mat_concrete);
     cat.singles[ONE_PIER]   = city__register_generated(cat, slab, cat.mat_dirt);

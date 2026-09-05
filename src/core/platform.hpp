@@ -25,6 +25,10 @@ struct pix_key_state {
 #define KEY_RIGHT 204
 #define KEY_ESC   205
 #define KEY_TAB   206
+// VK_OEM_4 / VK_OEM_6 on a US layout; remapped out of the OEM range so a key
+// code never collides with an ascii letter
+#define KEY_LEFT_BRACKET  207
+#define KEY_RIGHT_BRACKET 208
 // these keep their windows virtual key codes, which pix__map_vk passes through
 #define KEY_SHIFT 16
 #define KEY_CTRL  17
@@ -273,6 +277,8 @@ static int pix__map_vk(int vk) {
         case VK_RIGHT:  return KEY_RIGHT;
         case VK_ESCAPE: return KEY_ESC;
         case VK_TAB:    return KEY_TAB;
+        case VK_OEM_4:  return KEY_LEFT_BRACKET;
+        case VK_OEM_6:  return KEY_RIGHT_BRACKET;
     }
     if (vk > 0 && vk < 253) return vk; // letters/digits land on their ascii code
     return -1;

@@ -29,6 +29,9 @@
 #define CITY_WIDTH   1600
 #define CITY_HEIGHT   900
 
+// How long a full day takes when the clock is running, in real seconds.
+#define CITY_DAY_SECONDS 900.0f
+
 struct city_game {
     pix_window      window;
     pix_renderer    renderer;
@@ -54,6 +57,7 @@ struct city_game {
     float fps;
     bool  show_help;
     bool  mouse_look;
+    bool  clock_running;
     idx   ground_plane_mesh;
 };
 
@@ -64,10 +68,15 @@ void run_city_game();
 // One flat plane under the whole map so the horizon never shows a void where
 // the per-cell ground has been culled away.
 //
-// Its height matters: the roads are sunk so their kerbs line up with the
-// pavement, which puts the tarmac below y = 0. A filler plane at y = 0 would
-// therefore be drawn straight over every street in the city.
-#define BASE_PLANE_Y (ROAD_Y - 0.4f)
+// Its height matters, and it has to clear the *lowest* thing in the world, not
+// just the roads. The roads are sunk so their kerbs line up with the pavement,
+// which puts the tarmac below y = 0 - but the river bed is 6 m below that
+// again, and a filler plane tucked just under the tarmac was being drawn
+// straight across the top of the whole river. That is why the water could not
+// be seen at all: not a shader problem, an opaque sheet over it. Below the bed
+// it is out of the way of everything, and at the distance it is actually
+// visible (past the culled cells, in fog) the extra drop cannot be told apart.
+#define BASE_PLANE_Y (RIVER_BED - 1.0f)
 
 static void city__draw_base_plane(const city_game& g, pix_renderer& renderer) {
     if (g.ground_plane_mesh == (idx)-1) return;
@@ -140,6 +149,56 @@ static void city__draw_water(const city_world& w, pix_renderer& renderer,
     }
 }
 
+// ---- what is lit, and when ----
+//
+// Lights are submitted per frame, so "the street lamps come on at dusk" is this
+// function and nothing else: by day it hands over none, after dusk it hands
+// over the ones near the camera, and the renderer keeps the closest few. There
+// is no lamp state to switch and no lights to create or destroy.
+//
+// Colours are the ones the real fittings have: sodium street lighting is warm
+// and orange, headlights are a cool white, and having the two disagree is most
+// of what makes a night street read as a night street.
+static void city__submit_lights(const city_game& g, pix_renderer& renderer, vec3 eye) {
+    float night = renderer.night;
+    if (night <= 0.01f) return;
+
+    const float reach = 120.0f;
+    vec3 lamp_color = v3(2.60f, 1.55f, 0.62f);
+    for (size_t i = 0; i < g.world.lamp_count; i++) {
+        vec3 p = g.world.lamps[i];
+        float dx = p.x - eye.x, dz = p.z - eye.z;
+        if (dx * dx + dz * dz > reach * reach) continue;
+        push_light(renderer, pix_point_light(p, LAMP_RADIUS, v3scale(lamp_color, night)));
+    }
+
+    // Headlights. A cone out of the nose of the car, aimed slightly down the
+    // road rather than straight ahead, plus a small red bulb at the back so a
+    // queue of traffic reads from behind.
+    vec3 beam_color = v3(3.10f, 3.00f, 2.70f);
+    for (size_t i = 0; i < MAX_CARS; i++) {
+        const city_car& c = g.traffic.cars[i];
+        if (!c.active) continue;
+        float dx = c.position.x - eye.x, dz = c.position.z - eye.z;
+        if (dx * dx + dz * dz > reach * reach) continue;
+
+        const city_vehicle_model& vm = g.catalog.vehicles[c.model];
+        vec3 fwd = forward_from_yaw(c.yaw);
+        vec3 nose = v3add(c.position, v3scale(fwd, vm.half_length));
+        nose.y += 0.75f;
+        vec3 beam = v3norm(v3(fwd.x, -0.22f, fwd.z));
+        push_light(renderer, pix_spot_light(nose, beam, HEADLIGHT_RANGE,
+                                            0.30f, 0.62f, v3scale(beam_color, night)));
+
+        if (c.brake_light > 0.5f) {
+            vec3 tail = v3sub(c.position, v3scale(fwd, vm.half_length));
+            tail.y += 0.75f;
+            push_light(renderer, pix_point_light(tail, 5.0f,
+                                                 v3scale(v3(1.60f, 0.12f, 0.06f), night)));
+        }
+    }
+}
+
 static vec3 city__find_spawn(const city_world& w) {
     // walk outward from the middle of the map until a pavement cell turns up
     int cx = CITY_CELLS / 2, cz = CITY_CELLS / 2;
@@ -148,10 +207,65 @@ static vec3 city__find_spawn(const city_world& w) {
             for (int dx = -radius; dx <= radius; dx++) {
                 if (dx * dx + dz * dz < (radius - 1) * (radius - 1)) continue;
                 int x = cx + dx, z = cz + dz;
-                if (city_in_bounds(x, z) && city_at(w, x, z).kind == CELL_SIDEWALK)
-                    return cell_centre(x, z);
+                if (!city_in_bounds(x, z)) continue;
+                const city_cell& c = city_at(w, x, z);
+                if (c.kind != CELL_SIDEWALK || c.kerb == DIR_NONE) continue;
+                // on the walking strip, not the cell centre - a building now
+                // takes the back half of every pavement cell
+                return city_stand_point(w, x, z);
             }
     return v3(0.0f, 0.0f, 0.0f);
+}
+
+// One frame's worth of submission, in the order the renderer wants it: the
+// camera, then what lights the world, then what is in it.
+//
+// Everything here is a submission - no system draws itself and none of them
+// know about each other. Adding a system to the world means adding one line to
+// this function and nothing else, which is the property worth protecting as
+// more of them arrive.
+static void city__render_frame(city_game& g) {
+    camera cam;
+    city_player_camera(g.player, g.physics, &cam);
+    begin_frame(g.renderer, cam);
+
+    pix_set_time(g.renderer, g.time);
+    mat4 view_proj = mat4_mul(g.renderer.projection_matrix, g.renderer.view_matrix);
+    frustum view = frustum_from_viewproj(view_proj);
+
+    city__submit_lights(g, g.renderer, cam.position);
+
+    city__draw_base_plane(g, g.renderer);
+    city__draw_water(g.world, g.renderer, view, cam.position);
+    city__draw_world(g.world, g.renderer, view, cam.position);
+    city_traffic_draw(g.traffic, g.catalog, g.renderer, view, cam.position);
+    if (!city_player_on_foot(g.player))
+        city_car_draw(g.traffic.cars[g.player.car], g.catalog, g.renderer);
+    city_peds_draw(g.peds, g.catalog, g.renderer, view, cam.position);
+    city_player_draw(g.player, g.catalog, g.renderer);
+
+    end_frame(g.renderer);
+}
+
+// One frame's worth of simulation. Fixed order: the player moves first because
+// everything else takes the player's position as the centre of the world it
+// bothers to simulate, then the solver runs once for all of them, then each
+// system reads back what the solver decided.
+static void city__simulate(city_game& g, float dt) {
+    city_player_update(g.player, g.window, g.traffic, g.catalog, g.physics, dt);
+    city_traffic_update(g.traffic, g.world, g.catalog, g.physics, g.player.position, g.time, dt);
+    city_peds_update(g.peds, g.world, g.catalog, g.physics, g.player.position, g.time, dt);
+
+    phys_step(g.physics, dt);
+
+    city__read_back_all(g.traffic, g.physics);
+    if (city_player_on_foot(g.player)) {
+        phys_body* pb = phys_get_body(g.physics, g.player.body);
+        if (pb) g.player.position = pb->position;
+    } else {
+        g.player.position = g.traffic.cars[g.player.car].position;
+        g.player.yaw = g.traffic.cars[g.player.car].yaw;
+    }
 }
 
 static void city__build_hud(city_game& g, char* buffer, size_t capacity) {
@@ -169,14 +283,17 @@ static void city__build_hud(city_game& g, char* buffer, size_t capacity) {
             "  W A S D   walk / drive        mouse   look\n"
             "  shift     run                 space   jump  (handbrake in a car)\n"
             "  F         get in / out of the nearest car\n"
+            "  [ ]       wind the clock      N       run the day / night cycle\n"
             "  TAB       hide this panel     M       release the mouse\n"
             "  ESC       quit\n"
             "\n"
-            "%zu cars   %zu people   %zu props   %zu colliders   %zu water   %zu casts   %.0f MB",
+            "%02d:%02d   %zu cars   %zu people   %zu props   %zu colliders   "
+            "%zu lamps   %d lights   %.0f MB",
             g.fps, city_player_on_foot(p) ? "on foot" : "driving",
             ZONE_NAME[cell.zone < ZONE_COUNT ? cell.zone : 0],
+            (int)g.renderer.hour, (int)((g.renderer.hour - floorf(g.renderer.hour)) * 60.0f),
             g.traffic.count, g.peds.count, g.world.prop_count, g.physics.static_count,
-            g.world.water_count, g.catalog.character_count,
+            g.world.lamp_count, g.renderer.lights.packed_count,
             (double)g.loader.arena.size / (double)MB);
         return;
     }
@@ -221,11 +338,13 @@ void run_city_game() {
         return;
     }
 
-    idx shader = opengl_create_shader(VSHDER_BASIC, shader_with_common(FSHDER_BASIC));
+    idx shader = opengl_create_shader(VSHDER_BASIC, shader_with_pbr(FSHDER_BASIC));
     g.renderer = pix_create_renderer(CITY_WIDTH, CITY_HEIGHT, shader, v3(0.55f, 0.70f, 0.86f));
     g.renderer.projection_matrix =
         mat4_perspective(1.02f, (float)CITY_WIDTH / (float)CITY_HEIGHT, 0.25f, 1400.0f);
-    pix_enable_effects(g.renderer, 2048);
+    // Per cascade, not for the whole atlas: three of these sit side by side, so
+    // the sun is drawing 4608 x 1536 of depth every frame.
+    pix_enable_effects(g.renderer, 1536);
 
     // four 24-clip character rigs resample every bone onto a merged timeline,
     // which is by far the biggest thing in here
@@ -290,6 +409,15 @@ void run_city_game() {
         g.fps += ((dt > 0.0f ? 1.0f / dt : g.fps) - g.fps) * 0.08f;
 
         if (g.window.keystates[KEY_TAB].pressed) g.show_help = !g.show_help;
+        // Time of day. Held paused by default so the world looks the same every
+        // run, but the clock is real and everything - sun angle, sky, fog,
+        // whether the street lighting is on - hangs off it.
+        if (g.window.keystates['N'].pressed) g.clock_running = !g.clock_running;
+        float hour = g.renderer.hour;
+        if (g.window.keystates[KEY_LEFT_BRACKET].held)  hour -= dt * 3.0f;
+        if (g.window.keystates[KEY_RIGHT_BRACKET].held) hour += dt * 3.0f;
+        if (g.clock_running) hour += dt * (24.0f / CITY_DAY_SECONDS);
+        if (hour != g.renderer.hour) pix_set_time_of_day(g.renderer, hour);
         if (g.window.keystates['M'].pressed) {
             g.mouse_look = !g.mouse_look;
             pix_set_mouse_capture(g.window, g.mouse_look);
@@ -298,43 +426,11 @@ void run_city_game() {
         bool was_on_foot = city_player_on_foot(g.player);
 
         // ---- simulate ----
-        city_player_update(g.player, g.window, g.traffic, g.catalog, g.physics, dt);
-        city_traffic_update(g.traffic, g.world, g.catalog, g.physics, g.player.position, g.time, dt);
-        city_peds_update(g.peds, g.world, g.catalog, g.physics, g.player.position, g.time, dt);
-
-        phys_step(g.physics, dt);
-
-        // ---- pull the solved positions back into the game state ----
-        city__read_back_all(g.traffic, g.physics);
-        if (city_player_on_foot(g.player)) {
-            phys_body* pb = phys_get_body(g.physics, g.player.body);
-            if (pb) g.player.position = pb->position;
-        } else {
-            g.player.position = g.traffic.cars[g.player.car].position;
-            g.player.yaw = g.traffic.cars[g.player.car].yaw;
-        }
-
+        city__simulate(g, dt);
         city__update_audio(g, dt, was_on_foot);
 
         // ---- draw ----
-        camera cam;
-        city_player_camera(g.player, g.physics, &cam);
-        begin_frame(g.renderer, cam);
-
-        pix_set_time(g.renderer, g.time);
-        mat4 view_proj = mat4_mul(g.renderer.projection_matrix, g.renderer.view_matrix);
-        frustum view = frustum_from_viewproj(view_proj);
-
-        city__draw_base_plane(g, g.renderer);
-        city__draw_water(g.world, g.renderer, view, cam.position);
-        city__draw_world(g.world, g.renderer, view, cam.position);
-        city_traffic_draw(g.traffic, g.catalog, g.renderer, view, cam.position);
-        if (!city_player_on_foot(g.player))
-            city_car_draw(g.traffic.cars[g.player.car], g.catalog, g.renderer);
-        city_peds_draw(g.peds, g.catalog, g.renderer, view, cam.position);
-        city_player_draw(g.player, g.catalog, g.renderer);
-
-        end_frame(g.renderer);
+        city__render_frame(g);
 
         char hud[640];
         city__build_hud(g, hud, sizeof(hud));

@@ -42,6 +42,16 @@ static idx  animator_add_clip(animator& a, animation_clip_file_data* clip);
 // `time` is wrapped into the clip automatically, so raw elapsed time is fine.
 static void animator_sample(const animator& a, idx clip, float time, animation* out);
 
+// Two clips at once, blended `weight` of the way from `a_clip` to `b_clip`.
+//
+// The blend happens on each bone's local translation/rotation/scale, before the
+// hierarchy is walked - never on the finished skinning matrices. Lerping two
+// matrices that differ by a large rotation shears and shrinks the limb between
+// them, which on a jump (where the arms and legs are nowhere near their idle
+// pose) is worse than the pop it was meant to hide.
+static void animator_sample_blend(const animator& a, idx a_clip, float a_time,
+                                  idx b_clip, float b_time, float weight, animation* out);
+
 // convenience playback on top of it
 static void animator_play(animator& a, idx clip, bool loop = true, float speed = 1.0f);
 static void animator_update(animator& a, float dt);
@@ -143,6 +153,65 @@ static void animator_sample(const animator& a, idx clip, float time, animation* 
         mat4 local = mat4_from_trs(p, r, s);
         global[i] = (b.parent < 0) ? mat4_mul(sk.root_transform, local)
                                    : mat4_mul(global[b.parent], local); // parent is already resolved
+        out->bones[i] = mat4_mul(global[i], b.inverse_bind);
+    }
+}
+
+// one bone's local pose out of a clip; falls back to the bind pose when the
+// clip has no track for it
+static void anim__local(const skeleton_file_data& sk, const animation_clip_file_data* c,
+                        size_t i, float time, vec3* p, quat* r, vec3* s) {
+    const bone& b = sk.bones[i];
+    *p = b.local_position; *s = b.local_scale; *r = b.local_rotation;
+    if (!c || i >= c->track_count || !c->tracks[i].keyframe_count) return;
+
+    const bone_animation_track& tr = c->tracks[i];
+    size_t k = anim__find_key(tr.keyframes, tr.keyframe_count, time);
+    const bone_keyframe& k0 = tr.keyframes[k];
+    if (k + 1 >= tr.keyframe_count) { *p = k0.position; *s = k0.scale; *r = k0.rotation; return; }
+
+    const bone_keyframe& k1 = tr.keyframes[k + 1];
+    float span = k1.time - k0.time;
+    float u = (span > 1e-8f) ? (time - k0.time) / span : 0.0f;
+    if (u < 0.0f) u = 0.0f; else if (u > 1.0f) u = 1.0f;
+    *p = v3lerp(k0.position, k1.position, u);
+    *s = v3lerp(k0.scale, k1.scale, u);
+    *r = quat_slerp(k0.rotation, k1.rotation, u);
+}
+
+static float anim__wrap(const animation_clip_file_data* c, float time) {
+    if (!c || c->duration <= 0.0f) return time;
+    time = fmodf(time, c->duration);
+    return time < 0.0f ? time + c->duration : time;
+}
+
+static void animator_sample_blend(const animator& a, idx a_clip, float a_time,
+                                  idx b_clip, float b_time, float weight, animation* out) {
+    if (!a.skeleton) { out->bone_count = 0; return; }
+    if (weight <= 0.001f) { animator_sample(a, a_clip, a_time, out); return; }
+    if (weight >= 0.999f) { animator_sample(a, b_clip, b_time, out); return; }
+
+    const skeleton_file_data& sk = *a.skeleton;
+    const animation_clip_file_data* ca = (a_clip < a.clip_count) ? a.clips[a_clip] : 0;
+    const animation_clip_file_data* cb = (b_clip < a.clip_count) ? a.clips[b_clip] : 0;
+    a_time = anim__wrap(ca, a_time);
+    b_time = anim__wrap(cb, b_time);
+
+    size_t n = sk.bone_count < MAX_ANIM_BONES ? sk.bone_count : MAX_ANIM_BONES;
+    out->bone_count = n;
+
+    mat4 global[MAX_ANIM_BONES];
+    for (size_t i = 0; i < n; i++) {
+        vec3 pa, sa, pb, sb; quat ra, rb;
+        anim__local(sk, ca, i, a_time, &pa, &ra, &sa);
+        anim__local(sk, cb, i, b_time, &pb, &rb, &sb);
+
+        mat4 local = mat4_from_trs(v3lerp(pa, pb, weight),
+                                   quat_slerp(ra, rb, weight),
+                                   v3lerp(sa, sb, weight));
+        const bone& b = sk.bones[i];
+        global[i] = (b.parent < 0) ? mat4_mul(sk.root_transform, local)
+                                   : mat4_mul(global[b.parent], local);
         out->bones[i] = mat4_mul(global[i], b.inverse_bind);
     }
 }

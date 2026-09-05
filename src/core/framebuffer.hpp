@@ -32,7 +32,7 @@ struct framebuffer {
 // `hdr` picks RGBA16F over RGBA8, which is what lets a bloom or tonemap pass
 // work with values above 1 instead of clipping them at the source
 static framebuffer pix_create_render_target(int width, int height, bool hdr = true);
-static framebuffer pix_create_shadow_map(int resolution);
+static framebuffer pix_create_shadow_map(int width, int height);
 static void pix_destroy_framebuffer(framebuffer& target);
 
 static void pix_bind_framebuffer(const framebuffer& target);
@@ -112,15 +112,18 @@ static framebuffer pix_create_render_target(int width, int height, bool hdr) {
     return t;
 }
 
-static framebuffer pix_create_shadow_map(int resolution) {
+// `width` may be several tiles wide: cascaded shadows keep every cascade in one
+// texture side by side, so the whole set needs one sampler and one bind, and a
+// cascade is selected by offsetting the lookup rather than by swapping textures.
+static framebuffer pix_create_shadow_map(int width, int height) {
     framebuffer t = {};
-    t.width = resolution;
-    t.height = resolution;
+    t.width = width;
+    t.height = height;
 
     glGenFramebuffers(1, &t.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
 
-    t.depth = fb__make_depth(resolution, resolution, true);
+    t.depth = fb__make_depth(width, height, true);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, t.depth, 0);
 
     // no colour attachment: say so explicitly or the framebuffer is incomplete

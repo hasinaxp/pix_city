@@ -67,70 +67,23 @@ static const char* shader_with_common(const char* src) {
     return buf;
 }
 
-// The surface shader every solid thing in the world is drawn with. Metallic /
-// roughness PBR: a Cook-Torrance specular lobe (GGX distribution, height
-// correlated Smith visibility, Schlick Fresnel) over a Lambertian diffuse, lit
-// by one shadowed directional sun plus an image based ambient that samples the
-// same analytic sky the backdrop uses - so every glossy surface reflects the
-// real sky gradient and picks up a sun glint at the right angle.
+// ---- shared BRDF ----
 //
-// Albedo and tint arrive in sRGB and are linearised on read; all lighting is
-// done in linear space and the post pass does the tonemap and gamma encode.
-//
-// The shadow lookup is a sampler2DShadow, so the hardware does the depth
-// compare and its linear filter blends four taps for free; the 3x3 loop on top
-// of that gives a soft edge rather than a staircase. Bias is slope scaled -
-// a surface nearly edge-on to the sun needs far more of it than one facing it,
-// and a single constant either acnes the flat ground or detaches every shadow.
-const char* FSHDER_BASIC = R"(#version 440 core
-in vec3 vNormal;
-in vec2 vUV;
-in vec3 vWorld;
-out vec4 frag;
-
-uniform sampler2D uTex;
-uniform vec3  uColor;
-uniform float uMetallic;
-uniform float uRoughness;
-
-uniform vec3  uSunDir;        // normalised, pointing toward the sun
-uniform vec3  uSunColor;      // linear radiance
-uniform vec3  uSkyColor;      // hemisphere diffuse irradiance, from above
-uniform vec3  uGroundColor;   // hemisphere diffuse irradiance, bounced from below
-uniform vec3  uSkyZenith;     // sky-dome colour straight up   (reflections)
-uniform vec3  uSkyHorizon;    // sky-dome colour at the horizon (reflections)
-
-uniform mat4      uLightSpace;
-uniform sampler2DShadow uShadowMap;
-uniform float     uShadowTexel;
-uniform float     uShadowStrength;
-
-uniform vec3  uCameraPos;
-uniform vec3  uFogColor;
-uniform float uFogDensity;
-
+// Split out of the surface shader so the skinned pass, the water and anything
+// added later evaluate exactly the same material model. The pieces are the
+// standard ones and are named after the papers they come from, because the
+// point of a physically based renderer is that a surface behaves the way the
+// published model says it does rather than the way it was tuned to.
+const char* GLSL_BRDF = R"(
 const float PI = 3.14159265359;
 
-float sun_shadow(vec3 world, float ndl) {
-    vec4 light_pos = uLightSpace * vec4(world, 1.0);
-    vec3 p = light_pos.xyz / light_pos.w * 0.5 + 0.5;
-    if (p.z > 1.0 || p.z < 0.0) return 1.0;          // beyond the light's range
-
-    float bias = max(0.0035 * (1.0 - ndl), 0.0008);
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
-            sum += texture(uShadowMap, vec3(p.xy + vec2(x, y) * uShadowTexel, p.z - bias));
-    return sum * (1.0 / 9.0);
-}
-
-// GGX / Trowbridge-Reitz normal distribution
+// GGX / Trowbridge-Reitz normal distribution (Walter et al. 2007)
 float d_ggx(float ndh, float a) {
     float a2 = a * a;
     float d = ndh * ndh * (a2 - 1.0) + 1.0;
     return a2 / max(PI * d * d, 1e-8);
 }
-// height-correlated Smith visibility - already folds in the 1/(4 ndl ndv)
+// height-correlated Smith visibility (Heitz 2014) - folds in the 1/(4 ndl ndv)
 float v_smith(float ndv, float ndl, float a) {
     float a2 = a * a;
     float gv = ndl * sqrt(ndv * ndv * (1.0 - a2) + a2);
@@ -142,8 +95,8 @@ vec3 f_schlick(float u, vec3 f0) {
     return f0 + (1.0 - f0) * (m * m * m * m * m);
 }
 // Karis' analytic environment BRDF fit (the "mobile" split-sum approximation),
-// so the ambient specular carries the right Fresnel + roughness weight without
-// a precomputed LUT
+// so the ambient specular carries the right Fresnel and roughness weight
+// without a precomputed lookup table
 vec3 env_brdf(vec3 f0, float rough, float ndv) {
     const vec4 c0 = vec4(-1.0, -0.0275, -0.572,  0.022);
     const vec4 c1 = vec4( 1.0,  0.0425,  1.04,  -0.04);
@@ -153,53 +106,255 @@ vec3 env_brdf(vec3 f0, float rough, float ndv) {
     return f0 * ab.x + ab.y;
 }
 
+// One evaluation of the full material against one light direction. `radiance`
+// is what arrives at the surface; everything above it is geometry.
+vec3 surface_brdf(vec3 n, vec3 v, vec3 l, vec3 diff_albedo, vec3 f0, float a, vec3 radiance) {
+    vec3  h = normalize(l + v);
+    float ndl = max(dot(n, l), 0.0);
+    if (ndl <= 0.0) return vec3(0.0);
+    float ndv = max(dot(n, v), 1e-4);
+    float ndh = max(dot(n, h), 0.0);
+    float vdh = max(dot(v, h), 0.0);
+
+    vec3 F = f_schlick(vdh, f0);
+    vec3 spec = d_ggx(ndh, a) * v_smith(ndv, ndl, a) * F;
+    vec3 kd = vec3(1.0) - F;
+    return (kd * diff_albedo / PI + spec) * radiance * ndl;
+}
+
+// The direction a rough surface's specular lobe actually points. A perfect
+// mirror reflects along reflect(-v, n); as roughness climbs the lobe leans back
+// toward the normal, and using the mirror direction anyway is what makes rough
+// metal look like a warped mirror instead of like brushed metal.
+// (Frostbite's getSpecularDominantDir, Lagarde & de Rousiers 2014.)
+vec3 specular_dominant_dir(vec3 n, vec3 r, float rough) {
+    float smoothness = clamp(1.0 - rough, 0.0, 1.0);
+    float lerp_factor = smoothness * (sqrt(smoothness) + rough);
+    return normalize(mix(n, r, lerp_factor));
+}
+
+// Windowed inverse-square falloff (Karis 2013). Physically an inverse square
+// never reaches zero, which would mean every light in the world touches every
+// pixel; the window pulls it to exactly zero at `radius` so a light can be
+// culled at a known distance without a visible edge where it stops.
+float light_falloff(float dist2, float radius) {
+    float r2 = radius * radius;
+    float f = clamp(1.0 - (dist2 * dist2) / max(r2 * r2, 1e-6), 0.0, 1.0);
+    return (f * f) / max(dist2, 0.01);
+}
+)";
+
+// ---- punctual lights ----
+//
+// One uniform block shared by the surface and skinned shaders. Lights arrive
+// already reduced to the ones nearest the camera and packed into three vec4
+// arrays, so binding a frame's lighting is three uploads and no per-light work
+// in the draw loop.
+const char* GLSL_LIGHTS = R"(
+uniform int  uLightCount;
+uniform vec4 uLightPosRadius[32];    // xyz position, w radius
+uniform vec4 uLightColorInner[32];   // rgb linear radiance, w cos(inner cone)
+uniform vec4 uLightDirOuter[32];     // xyz direction, w cos(outer cone), < -1 = point
+
+vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, float a) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < uLightCount; ++i) {
+        vec3  to = uLightPosRadius[i].xyz - world;
+        float d2 = dot(to, to);
+        float radius = uLightPosRadius[i].w;
+        if (d2 > radius * radius) continue;
+
+        vec3  l = to * inversesqrt(max(d2, 1e-8));
+        float atten = light_falloff(d2, radius);
+
+        float cos_outer = uLightDirOuter[i].w;
+        if (cos_outer > -1.0) {                       // a cone, not a bulb
+            float cd = dot(-l, uLightDirOuter[i].xyz);
+            float t = clamp((cd - cos_outer)
+                            / max(uLightColorInner[i].w - cos_outer, 1e-4), 0.0, 1.0);
+            atten *= t * t;
+        }
+        if (atten <= 0.0) continue;
+
+        sum += surface_brdf(n, v, l, diff_albedo, f0, a, uLightColorInner[i].rgb * atten);
+    }
+    return sum;
+}
+)";
+
+// ---- cascaded shadow maps ----
+//
+// One directional light over a whole city cannot be served by one shadow map:
+// a single 2048 map stretched over the view distance gives texels metres across,
+// and stretched over the near field it stops casting anything past the end of
+// the street. So the view is split by distance into SHADOW_CASCADES slices, each
+// gets its own tightly fitted map, and a fragment picks the nearest slice it
+// falls inside.
+//
+// The three maps live side by side in one texture so the lookup needs one
+// sampler and one bind. Two details do most of the work in making the result
+// look solid rather than crawling:
+//
+//   normal offset  the sample position is pushed along the surface normal by
+//                  about a texel's worth of world space before it is projected.
+//                  A depth-only bias has to grow with the slope until it
+//                  detaches the shadow from whatever cast it; moving sideways
+//                  along the surface instead does not.
+//   cascade blend  the last stretch of each slice cross-fades into the next, so
+//                  the resolution change is a soft band rather than a visible
+//                  line drawn across the ground.
+const char* GLSL_SHADOW = R"(
+uniform mat4      uLightSpace[3];
+uniform vec4      uCascadeFar;        // xyz: view distance each cascade ends at
+uniform vec4      uCascadeTexel;      // xyz: one shadow texel in world metres
+uniform sampler2DShadow uShadowMap;
+uniform vec2      uShadowTexel;       // one texel of the whole atlas
+uniform float     uShadowStrength;
+
+float shadow_cascade(int c, vec3 world, vec3 n, float ndl) {
+    // normal offset, scaled by how oblique the light is to this surface
+    float slope = clamp(1.0 - ndl, 0.0, 1.0);
+    vec3 p_world = world + n * (uCascadeTexel[c] * (1.0 + 2.0 * slope) * 1.4);
+
+    vec4 lp = uLightSpace[c] * vec4(p_world, 1.0);
+    vec3 p = lp.xyz / lp.w * 0.5 + 0.5;
+    if (p.z > 1.0 || p.z < 0.0) return 1.0;
+
+    // the cascade's own tile inside the atlas, inset so a filter tap can never
+    // read across into its neighbour
+    float inset = uShadowTexel.x * 2.0;
+    p.x = clamp(p.x, inset, 1.0 - inset) / 3.0 + float(c) / 3.0;
+    p.y = clamp(p.y, uShadowTexel.y * 2.0, 1.0 - uShadowTexel.y * 2.0);
+
+    float bias = 0.0006;
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            sum += texture(uShadowMap, vec3(p.xy + vec2(float(x) * uShadowTexel.x,
+                                                        float(y) * uShadowTexel.y),
+                                            p.z - bias));
+    return sum * (1.0 / 9.0);
+}
+
+float sun_shadow(vec3 world, vec3 n, float ndl, float view_depth) {
+    if (uShadowStrength <= 0.0) return 1.0;
+
+    int c = 2;
+    if (view_depth < uCascadeFar.x)      c = 0;
+    else if (view_depth < uCascadeFar.y) c = 1;
+
+    float s = shadow_cascade(c, world, n, ndl);
+
+    // cross-fade the last tenth of a cascade into the next one
+    if (c < 2) {
+        float far_edge = (c == 0) ? uCascadeFar.x : uCascadeFar.y;
+        float band = far_edge * 0.12;
+        float t = clamp((view_depth - (far_edge - band)) / band, 0.0, 1.0);
+        if (t > 0.0) s = mix(s, shadow_cascade(c + 1, world, n, ndl), t);
+    }
+    return mix(1.0, s, uShadowStrength);
+}
+)";
+
+// Splices the sky, the BRDF, the light loop and the shadow lookup into a
+// shader in that order - each depends on the one before it.
+static const char* shader_with_pbr(const char* src) {
+    static char buf[3][32768];
+    static int  slot = 0;
+    char* out = buf[slot];
+    slot = (slot + 1) % 3;
+
+    const char* nl = strchr(src, '\n');
+    if (!nl) return src;
+    size_t head = (size_t)(nl - src) + 1;
+    memcpy(out, src, head);
+    int n = (int)head;
+    n += sprintf(out + n, "%s\n%s\n%s\n%s\n", GLSL_COMMON, GLSL_BRDF, GLSL_LIGHTS, GLSL_SHADOW);
+    sprintf(out + n, "%s", src + head);
+    return out;
+}
+
+// The surface shader every solid thing in the world is drawn with. Metallic /
+// roughness PBR: a Cook-Torrance specular lobe over a Lambertian diffuse, lit by
+//
+//   * one shadowed directional sun, through the cascades above
+//   * an image based ambient that samples the same analytic sky the backdrop
+//     uses, along the roughness-corrected dominant reflection direction - so a
+//     car roof mirrors the real sky gradient and a brick wall picks up only its
+//     broad tint
+//   * every punctual light near enough to matter, through the same BRDF
+//
+// Albedo and tint arrive in sRGB and are linearised on read; all lighting is
+// done in linear space and the post pass owns the tonemap and the single gamma
+// encode.
+const char* FSHDER_BASIC = R"(#version 440 core
+in vec3 vNormal;
+in vec2 vUV;
+in vec3 vWorld;
+out vec4 frag;
+
+uniform sampler2D uTex;
+uniform vec3  uColor;
+uniform float uMetallic;
+uniform float uRoughness;
+uniform vec3  uEmissive;      // linear radiance added straight to the result
+
+uniform vec3  uSunDir;        // normalised, pointing toward the sun
+uniform vec3  uSunColor;      // linear radiance
+uniform vec3  uSkyColor;      // hemisphere diffuse irradiance, from above
+uniform vec3  uGroundColor;   // hemisphere diffuse irradiance, bounced from below
+uniform vec3  uSkyZenith;     // sky-dome colour straight up   (reflections)
+uniform vec3  uSkyHorizon;    // sky-dome colour at the horizon (reflections)
+
+uniform vec3  uCameraPos;
+uniform vec3  uFogColor;
+uniform float uFogDensity;
+
 void main() {
     vec3 n = normalize(vNormal);
     vec3 v = normalize(uCameraPos - vWorld);
     float ndv = max(dot(n, v), 1e-4);
 
-    vec3 albedo = srgb_to_linear(texture(uTex, vUV).rgb * uColor);
-    float rough = clamp(uRoughness, 0.045, 1.0);
-    float metal = clamp(uMetallic, 0.0, 1.0);
-    float a = rough * rough;
+    vec3  albedo = srgb_to_linear(texture(uTex, vUV).rgb * uColor);
+    float rough  = clamp(uRoughness, 0.045, 1.0);
+    float metal  = clamp(uMetallic, 0.0, 1.0);
+    float a      = rough * rough;
 
     vec3 f0 = mix(vec3(0.04), albedo, metal);
     vec3 diff_albedo = albedo * (1.0 - metal);
 
     // ---- direct sun ----
-    vec3 l = normalize(uSunDir);
-    vec3 h = normalize(l + v);
+    vec3  l = normalize(uSunDir);
     float ndl = max(dot(n, l), 0.0);
-    float ndh = max(dot(n, h), 0.0);
-    float vdh = max(dot(v, h), 0.0);
+    float view_depth = length(uCameraPos - vWorld);
+    float shadow = sun_shadow(vWorld, n, ndl, view_depth);
+    vec3  direct = surface_brdf(n, v, l, diff_albedo, f0, a, uSunColor) * shadow;
 
-    float shadow = mix(1.0, sun_shadow(vWorld, ndl), uShadowStrength);
-    vec3  F = f_schlick(vdh, f0);
-    vec3  spec = d_ggx(ndh, a) * v_smith(ndv, ndl, a) * F;
-    vec3  kd = vec3(1.0) - F;
-    vec3  direct = (kd * diff_albedo / PI + spec) * uSunColor * (ndl * shadow);
+    // ---- punctual lights ----
+    direct += punctual_lights(vWorld, n, v, diff_albedo, f0, a);
 
-    // ---- ambient / image-based lighting off the analytic sky ----
+    // ---- ambient, off the analytic sky ----
     float hemi = n.y * 0.5 + 0.5;
-    vec3  irradiance = mix(uGroundColor, uSkyColor, hemi);
-    vec3  amb_diffuse = irradiance * diff_albedo;
+    vec3  amb_diffuse = mix(uGroundColor, uSkyColor, hemi) * diff_albedo;
 
-    // one mirror sample of the sky along the reflection vector is the whole
-    // reflection: sharp for a polished car, blurred toward the flat sky tint as
-    // roughness climbs (no prefiltered mips here, so fake the blur by lerping)
-    vec3  refl = reflect(-v, n);
-    vec3  mirror = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
-    vec3  rough_sky = mix(uSkyHorizon, uSkyZenith, clamp(refl.y * 0.5 + 0.5, 0.0, 1.0));
-    vec3  env = mix(mirror, rough_sky, rough);
-    vec3  amb_spec = env * env_brdf(f0, rough, ndv);
+    vec3 refl = specular_dominant_dir(n, reflect(-v, n), rough);
+    vec3 mirror = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
+    vec3 flat_dome = mix(uSkyHorizon, uSkyZenith, clamp(refl.y * 0.5 + 0.5, 0.0, 1.0));
+    // the mirror image survives longer on a smooth surface than a straight lerp
+    // on roughness would allow, which is what keeps car paint glossy
+    vec3 env = mix(mirror, flat_dome, rough * rough);
+
+    // a reflection that has bent below the surface it came off cannot be seen
+    // (Frostbite's horizon occlusion)
+    float horizon = clamp(1.0 + dot(reflect(-v, n), n), 0.0, 1.0);
+    vec3 amb_spec = env * env_brdf(f0, rough, ndv) * (horizon * horizon);
 
     // down-facing crevices see less of the sky
     float ao = mix(0.45, 1.0, hemi);
 
-    vec3 color = direct + (amb_diffuse + amb_spec) * ao;
+    vec3 color = direct + (amb_diffuse + amb_spec) * ao + uEmissive;
 
-    float dist = length(uCameraPos - vWorld);
-    float fog = 1.0 - exp(-dist * dist * uFogDensity * uFogDensity);
+    float fog = 1.0 - exp(-view_depth * view_depth * uFogDensity * uFogDensity);
     frag = vec4(mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0)), 1.0);
 }
 )";
@@ -308,28 +463,97 @@ void main() { }
 
 // ---- water ----
 //
-// A water body is one flat quad per cell, so it has four vertices and nothing
-// to displace. Everything that makes it read as water therefore has to happen
-// per *pixel*, not per vertex:
+// The wave field is one function, GLSL_WAVE, shared by the vertex and fragment
+// stages: the vertex stage uses its height to actually move the surface, the
+// fragment stage uses its gradient for a normal at full pixel resolution. It is
+// evaluated from world position, so neighbouring tiles agree exactly along
+// their shared edge and the river is one continuous sheet rather than a grid of
+// independently rippling squares.
 //
-//   * the wave field is evaluated in the fragment shader from the world
-//     position, and its analytic derivative gives a normal that ripples at full
-//     resolution however coarse the geometry is
-//   * two octaves - a slow swell and a fast chop - because a single sine reads
-//     as corrugated metal
-//   * Fresnel drives the mix from body colour to sky reflection, which is the
-//     single strongest cue: water is near transparent underfoot and a mirror
-//     toward the horizon
-//   * a wide, bright specular lobe gives the sun glitter
+// Everything that makes water read as water is here:
+//
+//   * the surface moves. A flat plane with a clever shader on it is a painted
+//     floor; a surface whose silhouette rises and falls against the far bank is
+//     immediately liquid. This is the single biggest cue and it needs real
+//     geometry, which is why the tile is subdivided.
+//   * four octaves - two slow swells crossing, two fast chops - because one
+//     sine reads as corrugated metal
+//   * Fresnel drives the mix from body colour to sky reflection: near
+//     transparent underfoot, a mirror toward the horizon
+//   * the body colour is a green-brown that deepens with distance below the
+//     surface, so shallows near a bank read differently from midstream
+//   * a tight specular for sun glitter over a broad one for sheen
+const char* GLSL_WAVE = R"(
+// .xyz is the surface normal, .w the height offset in metres.
+//
+// Six directional waves over three scales. The scales matter as much as the
+// count: the swell moves the silhouette, the chop is what the eye reads as
+// "liquid" from a few metres away, and the ripple is fine enough to keep
+// breaking up the sky reflection out to the far bank. Drop the ripple and a
+// river seen at a glancing angle - which is nearly always, from a camera
+// standing on the bank - turns into one unbroken mirror of a smooth sky
+// gradient, and a mirror that clean reads as sheet metal, not water.
+vec4 wave_field(vec2 p, float time) {
+    // direction, spatial frequency, amplitude (m), speed
+    const vec2  D[6] = vec2[6](vec2( 0.80,  0.60), vec2(-0.45,  0.89),
+                               vec2( 0.99, -0.14), vec2( 0.20,  0.98),
+                               vec2( 0.71, -0.71), vec2(-0.92, -0.39));
+    const float F[6] = float[6](0.085, 0.130, 0.480, 0.730, 1.850, 2.410);
+    const float A[6] = float[6](0.300, 0.190, 0.070, 0.045, 0.016, 0.011);
+    const float S[6] = float[6](0.550, 0.410, 1.700, 2.300, 3.400, 4.100);
+
+    float h = 0.0, dx = 0.0, dz = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        float phase = dot(p, D[i]) * F[i] + time * S[i];
+        h  += A[i] * sin(phase);
+        float c = cos(phase) * A[i] * F[i];
+        dx += c * D[i].x;
+        dz += c * D[i].y;
+    }
+
+    // The gradient of a field this gentle is nearly flat, so the normal is
+    // exaggerated - the ripple has to be visible in the lighting, not merely
+    // present in the geometry.
+    return vec4(normalize(vec3(-dx * 14.0, 1.0, -dz * 14.0)), h);
+}
+)";
+
+// Splices both GLSL_COMMON and GLSL_WAVE in after the #version line.
+//
+// Unlike shader_with_common this alternates between two buffers, because a
+// vertex and a fragment source have to be live at the same moment to be handed
+// to one opengl_create_shader call - and the water pass is the one place where
+// both stages need the same helper spliced in.
+static const char* shader_with_waves(const char* src) {
+    static char buf[2][16384];
+    static int  slot = 0;
+    char* out = buf[slot];
+    slot ^= 1;
+
+    const char* nl = strchr(src, '\n');
+    if (!nl) return src;
+    size_t head = (size_t)(nl - src) + 1;
+    memcpy(out, src, head);
+    int n = (int)head;
+    n += sprintf(out + n, "%s\n%s\n", GLSL_COMMON, GLSL_WAVE);
+    sprintf(out + n, "%s", src + head);
+    return out;
+}
+
 const char* VSHDER_WATER = R"(#version 440 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
 layout(location=3) in mat4 aModel;
-uniform mat4 uViewProj;
+uniform mat4  uViewProj;
+uniform float uTime;
 out vec3 vWorld;
 void main() {
     vec4 world = aModel * vec4(aPos, 1.0);
+    // Displace in world space, not model space: the tile is scaled by its cell
+    // size, and lifting before that scale would make the waves taller on a
+    // bigger tile.
+    world.y += wave_field(world.xz, uTime).w;
     vWorld = world.xyz;
     gl_Position = uViewProj * world;
 }
@@ -349,37 +573,10 @@ uniform vec3  uGroundColor;
 uniform vec3  uFogColor;
 uniform float uFogDensity;
 uniform float uTime;
-
-// height of the wave field at p, packed into .w, and its slope-derived normal
-// in .xyz - one evaluation gets both, since the normal is just the height
-// field's own gradient.
-vec4 wave_field(vec2 p) {
-    float h = 0.0, dx = 0.0, dz = 0.0;
-
-    // swell: long, slow, two crossing directions
-    vec2  d0 = vec2( 0.80,  0.60); float f0 = 0.085, a0 = 0.42, s0 = 0.55;
-    vec2  d1 = vec2(-0.45,  0.89); float f1 = 0.130, a1 = 0.30, s1 = 0.41;
-    // chop: short and quick, this is what actually sparkles
-    vec2  d2 = vec2( 0.99, -0.14); float f2 = 0.480, a2 = 0.055, s2 = 1.70;
-    vec2  d3 = vec2( 0.20,  0.98); float f3 = 0.730, a3 = 0.035, s3 = 2.30;
-
-    float p0 = dot(p, d0) * f0 + uTime * s0;
-    float p1 = dot(p, d1) * f1 + uTime * s1;
-    float p2 = dot(p, d2) * f2 + uTime * s2;
-    float p3 = dot(p, d3) * f3 + uTime * s3;
-
-    h = a0 * sin(p0) + a1 * sin(p1) + a2 * sin(p2) + a3 * sin(p3);
-    dx = cos(p0) * a0 * f0 * d0.x + cos(p1) * a1 * f1 * d1.x
-       + cos(p2) * a2 * f2 * d2.x + cos(p3) * a3 * f3 * d3.x;
-    dz = cos(p0) * a0 * f0 * d0.y + cos(p1) * a1 * f1 * d1.y
-       + cos(p2) * a2 * f2 * d2.y + cos(p3) * a3 * f3 * d3.y;
-
-    vec3 n = normalize(vec3(-dx * 6.0, 1.0, -dz * 6.0));
-    return vec4(n, h);
-}
+uniform float uBedDepth;      // metres from the surface down to the bed
 
 void main() {
-    vec4 wave = wave_field(vWorld.xz);
+    vec4 wave = wave_field(vWorld.xz, uTime);
     vec3 n = wave.xyz;
     vec3 view = normalize(uCameraPos - vWorld);
 
@@ -387,30 +584,41 @@ void main() {
     // swing to ~1 at grazing angles is what sells it as a liquid surface.
     float fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 5.0);
 
-    // Body colour tracks the wave crest, not the viewing angle: a crest
-    // catching the light reads lighter, a trough sits darker, and because that
-    // tracks uTime the whole surface visibly churns instead of holding one
-    // flat tint - the single biggest thing a static screenshot cannot sell but
-    // motion does. Mixing on view angle instead (the previous approach) made
-    // the body colour swap for the reflection colour at exactly the angles a
-    // third-person camera actually uses, so the water read as a flat grey slab.
-    float shimmer = clamp(wave.w / 0.35 * 0.5 + 0.5, 0.0, 1.0);
-    vec3 body = mix(srgb_to_linear(uDeepColor), srgb_to_linear(uShallowColor), shimmer);
+    // How far the eye is looking through the water: straight down it is the
+    // depth to the bed, at a glancing angle it is far further, and that is what
+    // makes the far side of a river read darker than the near edge. Wave height
+    // rides on top of it, so a crest is lighter than the trough beside it.
+    float through = uBedDepth / max(abs(view.y), 0.06);
+    float murk = 1.0 - exp(-through * 0.42);
+    float crest = clamp(wave.w * 1.3 + 0.5, 0.0, 1.0);
+    vec3 body = mix(srgb_to_linear(uShallowColor), srgb_to_linear(uDeepColor),
+                    clamp(murk - crest * 0.25, 0.0, 1.0));
 
-    // The reflection is now a real mirror sample of the same analytic sky the
+    // The reflection is a real mirror sample of the same analytic sky the
     // backdrop and every other surface use, taken along the wave-perturbed
     // reflection vector - so the water reflects the actual horizon gradient and
-    // catches the sun where the geometry says it should, instead of a flat
-    // hand-picked blue.
+    // catches the sun where the geometry says it should.
+    //
+    // Scaled down on the way in, because a surface that returns the sky at full
+    // strength is a mirror, and water is not: about four fifths of it comes
+    // back and the rest goes into the body of the water.
     vec3 refl = reflect(-view, n);
     refl.y = abs(refl.y);   // waves that tilt the normal below horizontal still see sky
-    vec3 sky = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
+    vec3 sky = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor) * 0.78;
 
     vec3 half_v = normalize(uSunDir + view);
-    float spec = pow(max(dot(n, half_v), 0.0), 260.0) * 4.0;      // sun glitter
-    spec += pow(max(dot(n, half_v), 0.0), 20.0) * 0.12;            // broad sheen
+    // Two lobes, both kept modest. A very tight, very bright highlight on a
+    // surface whose waves are smaller than a pixel at any distance does not
+    // sparkle, it smears into a chrome band across the whole river.
+    float ndh = max(dot(n, half_v), 0.0);
+    float spec = pow(ndh, 200.0) * 1.6;      // sun glitter
+    spec += pow(ndh, 18.0) * 0.06;           // broad sheen
 
-    vec3 color = mix(body, sky, fresnel) + uSunColor * spec;
+    // Never a pure reflection even edge on. Some of what comes back off water at
+    // a glancing angle is still the water, and holding a little of the body
+    // colour in is what keeps a river reading as a river rather than as a strip
+    // of polished metal laid in the ground.
+    vec3 color = mix(body, sky, fresnel * 0.88) + uSunColor * spec;
 
     // atmospheric fog only at real distance - the near-field colour above is
     // left alone so nearby water still reads as water, not haze
@@ -418,8 +626,9 @@ void main() {
     float fog = 1.0 - exp(-dist * dist * uFogDensity * uFogDensity);
     color = mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0) * 0.85);
 
-    // more opaque at a glancing angle, clearer looking straight down
-    frag = vec4(color, mix(0.75, 0.97, fresnel));
+    // Opacity tracks the same view-through-the-water term as the colour: you
+    // can see the bed at your feet and cannot see it across the river.
+    frag = vec4(color, clamp(mix(0.55, 0.98, max(murk, fresnel)), 0.0, 1.0));
 }
 )";
 

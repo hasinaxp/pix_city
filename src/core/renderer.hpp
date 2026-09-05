@@ -7,6 +7,7 @@
 #include "../loader/data_loader.hpp"
 #include "../loader/png_loader.hpp"
 #include "opengl_utils.hpp"
+#include "lighting.hpp"
 #include "framebuffer.hpp"
 #include "shader_sources.hpp"
 #include "animation.hpp"
@@ -14,6 +15,7 @@
 #define MAX_RENDERABLE 24576           // a city block's worth of props survives culling
 #define MAX_ANIMATED   96              // animated instances drawn per frame
 #define MAX_MESHES     512
+#define MAX_WATER_INSTANCES 4096       // surface tiles visible at once
 #define MAX_MATERIALS  128
 #define MAX_SHADERS    32
 #define MESH_POOL_VERTICES (1 << 20)   // shared vertex buffer capacity
@@ -36,12 +38,16 @@ struct material {
     vec3 color;
     float metallic;
     float roughness;
+    // Linear radiance the surface gives off by itself. Zero for almost
+    // everything; it is what a lit window, a brake light or a lamp head is,
+    // and it is the channel the bloom pass exists to serve.
+    vec3 emissive;
 };
 
 struct pix_render_instance {
     idx mesh;
     idx material;
-    mat4 trainsform;
+    mat4 transform;
 };
 
 struct camera {
@@ -114,30 +120,40 @@ struct pix_renderer {
     float       bloom_knee;
     float       bloom_strength;
 
-    vec3  sun_direction;   // normalised, pointing at the sun
-    vec3  sun_color;        // linear radiance, not a 0..1 colour
-    vec3  sky_color;       // hemisphere diffuse irradiance from above
-    vec3  ground_color;    // hemisphere diffuse irradiance bounced from below
-    vec3  sky_zenith;      // sky-dome colour straight up   (backdrop + reflections)
-    vec3  sky_horizon;     // sky-dome colour at the horizon (backdrop + reflections)
-    vec3  fog_color;
-    float fog_density;
+    // The sun and the sky are described by lighting.hpp and mirrored into the
+    // flat fields the shader uniforms are fed from, so a caller can set an hour
+    // of the day and everything downstream follows.
+    pix_sun sun;
+    pix_sky sky;
+    float   hour;          // time of day, 0..24
+    float   night;         // 0 by day, 1 after dusk; what artificial light rides on
+
+    pix_light_list lights;
+
     float shadow_strength; // 0 turns shadows off without unbinding anything
-    float shadow_extent;   // half width of the sun's ortho box, metres
-    float shadow_depth;    // how far along the sun direction it reaches
+    float shadow_extent;   // half width of the furthest cascade, metres
+    float shadow_depth;    // how far along the sun direction the box reaches
     float exposure;
     float saturation;
     float vignette;
     float sharpen;
 
-    mat4 light_space;      // world -> shadow map clip
+    // one shadow projection per cascade, near to far, plus where each ends
+    mat4  light_space[SHADOW_CASCADES];
+    float cascade_far[SHADOW_CASCADES];
+    float cascade_texel[SHADOW_CASCADES];   // one shadow texel in world metres
     vec3 camera_position;
 
-    // water is drawn after the opaque pass, blended, from its own list
-    pix_render_instance water_instances[256];
+    // Water is drawn after the opaque pass, blended, from its own list. It has
+    // to be big enough for every water cell that can be on screen at once: a
+    // river six cells wide running the length of a VIEW_DISTANCE draw is well
+    // over a thousand tiles, and a queue that silently stops accepting them
+    // ends the river in a straight line across the middle of the view.
+    pix_render_instance water_instances[MAX_WATER_INSTANCES];
     size_t water_count;
     vec3   water_shallow;
     vec3   water_deep;
+    float  water_depth;    // metres from the surface to the bed, for the murk term
     float  time;
 };
 
@@ -145,6 +161,17 @@ struct pix_renderer {
 static pix_renderer pix_create_renderer(
     int width, int height, idx shader, vec3 clear_color = { 0.0f, 0.5f, 0.8f });
 static void pix_destory_renderer(pix_renderer& renderer);
+
+// Sets the sun, the sky, the fog and how much artificial light the world should
+// be running, all from one hour of the day. See lighting.hpp for the keyframes.
+static void pix_set_time_of_day(pix_renderer& renderer, float hour);
+
+// Lights are submitted per frame the way draw calls are: cleared in
+// begin_frame, added by whoever owns them, and reduced to the nearest few in
+// end_frame. A light that stops being submitted stops existing, which is what
+// makes a street of lamps that fade up at dusk one line of gameplay code
+// rather than a resource to manage.
+static void push_light(pix_renderer& renderer, const pix_light& light);
 
 static idx load_mesh(pix_renderer& renderer, mesh_file_data& mesh_data);
 static idx load_skinned_mesh(pix_renderer& renderer, skinned_mesh_file_data& mesh_data);
@@ -184,6 +211,16 @@ static void end_frame(pix_renderer& renderer, bool clear_instances = true);
 
 
 // ------------------- implementation ---------------------
+
+static void pix_set_time_of_day(pix_renderer& r, float hour) {
+    r.hour = hour;
+    pix_daylight_at(hour, &r.sun, &r.sky);
+    r.night = pix_night_factor(r.sun);
+}
+
+static void push_light(pix_renderer& r, const pix_light& light) {
+    pix_lights_add(r.lights, light);
+}
 
 static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 clear_color) {
     pix_renderer r = {};
@@ -244,7 +281,7 @@ static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 
 
     glBindVertexArray(0);
 
-    r.skinned_shader = opengl_create_shader(VSHDER_SKINNED, shader_with_common(FSHDER_BASIC));
+    r.skinned_shader = opengl_create_shader(VSHDER_SKINNED, shader_with_pbr(FSHDER_BASIC));
 
     unsigned char white[4] = { 255, 255, 255, 255 };
     r.white_texture = opengl_create_texture2d(1, 1, 4, white, TEXTURE_PIXELATED);
@@ -260,18 +297,11 @@ static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 
     // the sun sits well above 1, the sky/ground terms are pre-integrated diffuse
     // irradiance. Ambient still has to stay well under the sun or shadowed faces
     // wash out and the shadow map stops being visible - the point of casting it.
-    r.sun_direction = v3norm(v3(0.42f, 0.80f, 0.43f));
-    r.sun_color     = v3(2.05f, 1.78f, 1.42f);
-    r.sky_color     = v3(0.24f, 0.31f, 0.44f);
-    r.ground_color  = v3(0.14f, 0.13f, 0.11f);
-    // the sky dome the backdrop draws and every surface reflects
-    r.sky_zenith    = v3(0.13f, 0.31f, 0.62f);
-    r.sky_horizon   = v3(0.54f, 0.67f, 0.84f);
-    r.fog_color     = v3(0.58f, 0.69f, 0.84f);
-    r.fog_density   = 0.0012f;
+    pix_set_time_of_day(r, 10.0f);      // a late morning, shadows short and legible
+    pix_lights_clear(r.lights);
     r.shadow_strength = 1.0f;
-    r.shadow_extent = 130.0f;
-    r.shadow_depth  = 420.0f;
+    r.shadow_extent = 220.0f;
+    r.shadow_depth  = 620.0f;
     r.exposure      = 0.95f;
     r.saturation    = 1.10f;
     // threshold just above diffuse white, so only genuine speculars glare
@@ -280,16 +310,25 @@ static pix_renderer pix_create_renderer(int width, int height, idx shader, vec3 
     r.bloom_strength  = 0.55f;
     r.vignette      = 0.24f;
     r.sharpen       = 0.25f;
-    r.water_shallow = v3(0.10f, 0.34f, 0.40f);
-    r.water_deep    = v3(0.02f, 0.09f, 0.17f);
-    r.light_space   = mat4_identity();
+    // A real river is a green-brown that the sky sits on top of, not a blue.
+    // The blue comes from the reflection; making the body blue as well gives
+    // the flat cyan slab that reads as a swimming pool.
+    r.water_shallow = v3(0.13f, 0.22f, 0.19f);
+    r.water_deep    = v3(0.03f, 0.07f, 0.08f);
+    r.water_depth   = 2.1f;
+    for (int c = 0; c < SHADOW_CASCADES; c++) r.light_space[c] = mat4_identity();
     return r;
 }
 
 static void pix_enable_effects(pix_renderer& r, int shadow_resolution) {
     if (r.effects) return;
     r.scene_target = pix_create_render_target(r.width, r.height, true);
-    r.shadow_map   = pix_create_shadow_map(shadow_resolution);
+    // One atlas, the cascades side by side. Three separate maps would need
+    // three samplers and three binds per draw; one texture needs neither, and
+    // the only cost is remembering to inset each tile so a filter tap cannot
+    // read into its neighbour.
+    r.shadow_map   = pix_create_shadow_map(shadow_resolution * SHADOW_CASCADES,
+                                           shadow_resolution);
     // quarter res is plenty: the result is about to be blurred anyway, and it
     // makes the two Gaussian passes essentially free
     int bw = r.width / 4 > 1 ? r.width / 4 : 1;
@@ -301,7 +340,12 @@ static void pix_enable_effects(pix_renderer& r, int shadow_resolution) {
     r.depth_shader         = opengl_create_shader(VSHDER_DEPTH, FSHDER_DEPTH);
     r.depth_skinned_shader = opengl_create_shader(VSHDER_DEPTH_SKINNED, FSHDER_DEPTH);
     r.post_shader          = opengl_create_shader(VSHDER_POST, shader_with_common(FSHDER_POST));
-    r.water_shader         = opengl_create_shader(VSHDER_WATER, shader_with_common(FSHDER_WATER));
+    // both stages evaluate the same wave field, so both get it spliced in
+    {
+        const char* wvs = shader_with_waves(VSHDER_WATER);
+        const char* wfs = shader_with_waves(FSHDER_WATER);
+        r.water_shader = opengl_create_shader(wvs, wfs);
+    }
     r.sky_shader           = opengl_create_shader(VSHDER_SKY,  shader_with_common(FSHDER_SKY));
     r.effects = true;
 }
@@ -309,11 +353,11 @@ static void pix_enable_effects(pix_renderer& r, int shadow_resolution) {
 static void pix_set_time(pix_renderer& r, float seconds) { r.time = seconds; }
 
 static void push_water(pix_renderer& r, idx mesh, idx material, const mat4& transform) {
-    if (mesh == (idx)-1 || r.water_count >= 256) return;
+    if (mesh == (idx)-1 || r.water_count >= MAX_WATER_INSTANCES) return;
     pix_render_instance& it = r.water_instances[r.water_count++];
     it.mesh = mesh;
     it.material = material;
-    it.trainsform = transform;
+    it.transform = transform;
 }
 
 static void pix_destory_renderer(pix_renderer& renderer) {
@@ -399,6 +443,7 @@ static idx load_material(pix_renderer& r, const char* texture_path, vec3 color, 
     mat.color = color;
     mat.metallic = metalic;
     mat.roughness = roughness;
+    mat.emissive = v3(0.0f, 0.0f, 0.0f);
 
     if (texture_path) {
         png_result png = {};
@@ -421,6 +466,7 @@ static idx load_material_image(pix_renderer& r, image_file_data* image, vec3 col
     mat.color = color;
     mat.metallic = metalic;
     mat.roughness = roughness;
+    mat.emissive = v3(0.0f, 0.0f, 0.0f);
     if (image && image->data)
         mat.texture = opengl_create_texture2d(image->width, image->height, 4, image->data,
                                               pixelated ? TEXTURE_PIXELATED : TEXTURE_LINEAR);
@@ -437,6 +483,7 @@ static idx clone_material(pix_renderer& r, idx source, vec3 color,
     mat.color = color;
     mat.metallic = metallic;
     mat.roughness = roughness;
+    mat.emissive = r.materials[source].emissive;
     return id;
 }
 
@@ -450,25 +497,46 @@ static idx load_shader(pix_renderer& r, const char* vsrc, const char* fsrc) {
     return prog;
 }
 
-// Fits the sun's orthographic box around the camera and snaps it to whole
-// shadow map texels. Without the snap the box slides continuously as the player
-// walks and every shadow edge crawls and shimmers; with it the box only ever
-// moves in whole texel steps, and the edges sit still.
-static void pix__fit_light(pix_renderer& r, const camera& cam) {
-    vec3 focus = v3add(cam.position, v3scale(cam.direction, r.shadow_extent * 0.55f));
-    focus.y = 0.0f;
+// Fits one orthographic box per cascade around the slice of the view it covers,
+// and snaps each to whole shadow-map texels.
+//
+// Without the snap the box slides continuously as the player walks and every
+// shadow edge crawls and shimmers; with it the box only ever moves in whole
+// texel steps and the edges sit still. The splits are geometric rather than
+// even, because perspective means the near half of the view occupies most of
+// the screen and deserves most of the resolution.
+static void pix__fit_cascades(pix_renderer& r, const camera& cam) {
+    const float near_plane = 6.0f;
+    int tile = r.shadow_map.height;                 // the atlas is square per tile
 
-    float texel = (r.shadow_extent * 2.0f) / (float)r.shadow_map.width;
-    focus.x = floorf(focus.x / texel) * texel;
-    focus.z = floorf(focus.z / texel) * texel;
+    for (int c = 0; c < SHADOW_CASCADES; c++) {
+        // 6 m, 40 m, 220 m for three cascades over a 220 m extent
+        float t = (float)(c + 1) / (float)SHADOW_CASCADES;
+        float far_d = near_plane * powf(r.shadow_extent / near_plane, t);
+        r.cascade_far[c] = far_d;
 
-    vec3 eye = v3add(focus, v3scale(r.sun_direction, r.shadow_depth * 0.5f));
-    // the sun is never straight overhead here, so world up is a safe reference
-    mat4 light_view = mat4_lookat(eye, focus, v3(0.0f, 1.0f, 0.0f));
+        // The box has to cover the slice from whatever angle the camera is at,
+        // so it is sized by the slice's diagonal rather than its length - which
+        // is also what makes its size independent of where the camera looks,
+        // and therefore stable under rotation.
+        float near_d = (c == 0) ? 0.0f
+                                : near_plane * powf(r.shadow_extent / near_plane,
+                                                    (float)c / (float)SHADOW_CASCADES);
+        float extent = (far_d - near_d) * 0.75f + far_d * 0.35f;
 
-    float e = r.shadow_extent;
-    mat4 light_proj = mat4_ortho(-e, e, -e, e, 1.0f, r.shadow_depth);
-    r.light_space = mat4_mul(light_proj, light_view);
+        vec3 focus = v3add(cam.position, v3scale(cam.direction, (near_d + far_d) * 0.5f));
+        focus.y = 0.0f;
+
+        float texel = (extent * 2.0f) / (float)tile;
+        focus.x = floorf(focus.x / texel) * texel;
+        focus.z = floorf(focus.z / texel) * texel;
+        r.cascade_texel[c] = texel;
+
+        vec3 eye = v3add(focus, v3scale(r.sun.direction, r.shadow_depth * 0.5f));
+        mat4 light_view = mat4_lookat(eye, focus, v3(0.0f, 1.0f, 0.0f));
+        mat4 light_proj = mat4_ortho(-extent, extent, -extent, extent, 1.0f, r.shadow_depth);
+        r.light_space[c] = mat4_mul(light_proj, light_view);
+    }
 }
 
 static void begin_frame(pix_renderer& r, camera& cam) {
@@ -477,7 +545,8 @@ static void begin_frame(pix_renderer& r, camera& cam) {
     r.renderable_count = 0;
     r.animated_count = 0;
     r.water_count = 0;
-    if (r.effects) pix__fit_light(r, cam);
+    pix_lights_clear(r.lights);
+    if (r.effects) pix__fit_cascades(r, cam);
 }
 
 static void push_instance(pix_renderer& r, pix_render_instance& instance) {
@@ -492,7 +561,7 @@ static void push_instance(pix_renderer& r, idx mesh, idx material, const mat4& t
     pix_render_instance& it = r.instances[r.renderable_count++];
     it.mesh = mesh;
     it.material = material;
-    it.trainsform = transform;
+    it.transform = transform;
 }
 
 static void push_animated_instance(pix_renderer& r, pix_render_instance& instance, const animation& pose) {
@@ -540,6 +609,7 @@ static void pix__draw_instanced(pix_renderer& r, idx program, bool with_material
     GLint u_color    = with_material ? glGetUniformLocation(program, "uColor")     : -1;
     GLint u_metallic = with_material ? glGetUniformLocation(program, "uMetallic")  : -1;
     GLint u_rough    = with_material ? glGetUniformLocation(program, "uRoughness") : -1;
+    GLint u_emissive = with_material ? glGetUniformLocation(program, "uEmissive")  : -1;
 
     glBindVertexArray(r.vao);
     glBindBuffer(GL_ARRAY_BUFFER, r.instances_vbo);
@@ -550,7 +620,7 @@ static void pix__draw_instanced(pix_renderer& r, idx program, bool with_material
         idx ma = r.instances[i].material;
         size_t j = i;
         while (j < r.renderable_count && r.instances[j].mesh == mi && r.instances[j].material == ma) {
-            batch[j - i] = r.instances[j].trainsform;
+            batch[j - i] = r.instances[j].transform;
             j++;
         }
         int n = (int)(j - i);
@@ -563,6 +633,7 @@ static void pix__draw_instanced(pix_renderer& r, idx program, bool with_material
             glUniform3f(u_color, mat.color.x, mat.color.y, mat.color.z);
             glUniform1f(u_metallic, mat.metallic);
             glUniform1f(u_rough, mat.roughness);
+            glUniform3f(u_emissive, mat.emissive.x, mat.emissive.y, mat.emissive.z);
         }
 
         mesh& me = r.meshes[mi];
@@ -580,6 +651,7 @@ static void pix__draw_skinned(pix_renderer& r, idx program, bool with_material) 
     GLint u_color    = with_material ? glGetUniformLocation(program, "uColor")     : -1;
     GLint u_metallic = with_material ? glGetUniformLocation(program, "uMetallic")  : -1;
     GLint u_rough    = with_material ? glGetUniformLocation(program, "uRoughness") : -1;
+    GLint u_emissive = with_material ? glGetUniformLocation(program, "uEmissive")  : -1;
     GLint u_model = glGetUniformLocation(program, "uModel");
     GLint u_bones = glGetUniformLocation(program, "uBones[0]");
     if (u_bones < 0) u_bones = glGetUniformLocation(program, "uBones");
@@ -597,8 +669,9 @@ static void pix__draw_skinned(pix_renderer& r, idx program, bool with_material) 
             glUniform3f(u_color, mat.color.x, mat.color.y, mat.color.z);
             glUniform1f(u_metallic, mat.metallic);
             glUniform1f(u_rough, mat.roughness);
+            glUniform3f(u_emissive, mat.emissive.x, mat.emissive.y, mat.emissive.z);
         }
-        glUniformMatrix4fv(u_model, 1, GL_FALSE, inst.trainsform.data);
+        glUniformMatrix4fv(u_model, 1, GL_FALSE, inst.transform.data);
 
         size_t nb = pose->bone_count < MAX_ANIM_BONES ? pose->bone_count : MAX_ANIM_BONES;
         if (nb) glUniformMatrix4fv(u_bones, (GLsizei)nb, GL_FALSE, pose->bones[0].data);
@@ -612,27 +685,45 @@ static void pix__draw_skinned(pix_renderer& r, idx program, bool with_material) 
 
 static void pix__set_lighting(pix_renderer& r, idx program) {
     glUniform3f(glGetUniformLocation(program, "uSunDir"),
-                r.sun_direction.x, r.sun_direction.y, r.sun_direction.z);
+                r.sun.direction.x, r.sun.direction.y, r.sun.direction.z);
     glUniform3f(glGetUniformLocation(program, "uSunColor"),
-                r.sun_color.x, r.sun_color.y, r.sun_color.z);
+                r.sun.color.x, r.sun.color.y, r.sun.color.z);
     glUniform3f(glGetUniformLocation(program, "uSkyColor"),
-                r.sky_color.x, r.sky_color.y, r.sky_color.z);
+                r.sky.diffuse_up.x, r.sky.diffuse_up.y, r.sky.diffuse_up.z);
     glUniform3f(glGetUniformLocation(program, "uGroundColor"),
-                r.ground_color.x, r.ground_color.y, r.ground_color.z);
+                r.sky.diffuse_down.x, r.sky.diffuse_down.y, r.sky.diffuse_down.z);
     glUniform3f(glGetUniformLocation(program, "uSkyZenith"),
-                r.sky_zenith.x, r.sky_zenith.y, r.sky_zenith.z);
+                r.sky.zenith.x, r.sky.zenith.y, r.sky.zenith.z);
     glUniform3f(glGetUniformLocation(program, "uSkyHorizon"),
-                r.sky_horizon.x, r.sky_horizon.y, r.sky_horizon.z);
+                r.sky.horizon.x, r.sky.horizon.y, r.sky.horizon.z);
     glUniform3f(glGetUniformLocation(program, "uFogColor"),
-                r.fog_color.x, r.fog_color.y, r.fog_color.z);
-    glUniform1f(glGetUniformLocation(program, "uFogDensity"), r.fog_density);
+                r.sky.fog.x, r.sky.fog.y, r.sky.fog.z);
+    glUniform1f(glGetUniformLocation(program, "uFogDensity"), r.sky.fog_density);
     glUniform3f(glGetUniformLocation(program, "uCameraPos"),
                 r.camera_position.x, r.camera_position.y, r.camera_position.z);
 }
 
+// The frame's punctual lights, already reduced to the nearest few. Three array
+// uploads and a count - there is no per-light work here, which is the whole
+// reason the list is packed the way it is.
+static void pix__bind_lights(pix_renderer& r, idx program) {
+    int n = r.lights.packed_count;
+    glUniform1i(glGetUniformLocation(program, "uLightCount"), n);
+    if (!n) return;
+    glUniform4fv(glGetUniformLocation(program, "uLightPosRadius[0]"),  n, r.lights.pos_radius);
+    glUniform4fv(glGetUniformLocation(program, "uLightColorInner[0]"), n, r.lights.color_inner);
+    glUniform4fv(glGetUniformLocation(program, "uLightDirOuter[0]"),   n, r.lights.dir_outer);
+}
+
 static void pix__bind_shadow(pix_renderer& r, idx program) {
-    glUniformMatrix4fv(glGetUniformLocation(program, "uLightSpace"), 1, GL_FALSE, r.light_space.data);
-    glUniform1f(glGetUniformLocation(program, "uShadowTexel"), 1.0f / (float)r.shadow_map.width);
+    glUniformMatrix4fv(glGetUniformLocation(program, "uLightSpace[0]"), SHADOW_CASCADES,
+                       GL_FALSE, r.light_space[0].data);
+    glUniform4f(glGetUniformLocation(program, "uCascadeFar"),
+                r.cascade_far[0], r.cascade_far[1], r.cascade_far[2], 0.0f);
+    glUniform4f(glGetUniformLocation(program, "uCascadeTexel"),
+                r.cascade_texel[0], r.cascade_texel[1], r.cascade_texel[2], 0.0f);
+    glUniform2f(glGetUniformLocation(program, "uShadowTexel"),
+                1.0f / (float)r.shadow_map.width, 1.0f / (float)r.shadow_map.height);
     glUniform1f(glGetUniformLocation(program, "uShadowStrength"),
                 r.effects ? r.shadow_strength : 0.0f);
     glUniform1i(glGetUniformLocation(program, "uShadowMap"), 1);
@@ -651,30 +742,81 @@ static void pix__shadow_pass(pix_renderer& r) {
     glEnable(GL_CULL_FACE);
     glCullFace(GL_FRONT);
 
-    glUseProgram(r.depth_shader);
-    glUniformMatrix4fv(glGetUniformLocation(r.depth_shader, "uViewProj"), 1, GL_FALSE,
-                       r.light_space.data);
-    pix__draw_instanced(r, r.depth_shader, false);
+    int tile = r.shadow_map.height;
+    for (int c = 0; c < SHADOW_CASCADES; c++) {
+        glViewport(c * tile, 0, tile, tile);
 
-    if (r.animated_count) {
-        glUseProgram(r.depth_skinned_shader);
-        glUniformMatrix4fv(glGetUniformLocation(r.depth_skinned_shader, "uViewProj"), 1, GL_FALSE,
-                           r.light_space.data);
-        pix__draw_skinned(r, r.depth_skinned_shader, false);
+        glUseProgram(r.depth_shader);
+        glUniformMatrix4fv(glGetUniformLocation(r.depth_shader, "uViewProj"), 1, GL_FALSE,
+                           r.light_space[c].data);
+        pix__draw_instanced(r, r.depth_shader, false);
+
+        // Characters only cast into the near cascades. A person is under two
+        // metres across; by the far cascade one is smaller than a shadow texel,
+        // so the draw costs a full skinned pass and puts nothing on screen.
+        if (r.animated_count && c < SHADOW_CASCADES - 1) {
+            glUseProgram(r.depth_skinned_shader);
+            glUniformMatrix4fv(glGetUniformLocation(r.depth_skinned_shader, "uViewProj"), 1,
+                               GL_FALSE, r.light_space[c].data);
+            pix__draw_skinned(r, r.depth_skinned_shader, false);
+        }
     }
+    glViewport(0, 0, r.shadow_map.width, r.shadow_map.height);
 
     glCullFace(GL_BACK);
     glDisable(GL_CULL_FACE);
     glBindVertexArray(0);
 }
 
+// ---- bloom ----
+//
+// The scene target is real HDR, so a sun glint off a car roof, a lamp head or a
+// wave crest is genuinely brighter than 1 while the tonemap squashes it back to
+// near white. This is what puts that energy back on screen as glare, and it is
+// the single thing that makes a bright highlight read as *bright* rather than
+// as a pale patch. Threshold with a soft knee, then two separable Gaussians at
+// quarter resolution.
+static void pix__bloom_pass(pix_renderer& r) {
+    if (r.bloom_strength <= 0.0f || !r.bloom_prefilter_shader) return;
+
+    pix_bind_framebuffer(r.bloom_a);
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(r.bloom_prefilter_shader);
+    glUniform1i(glGetUniformLocation(r.bloom_prefilter_shader, "uScene"), 0);
+    glUniform2f(glGetUniformLocation(r.bloom_prefilter_shader, "uTexel"),
+                1.0f / (float)r.width, 1.0f / (float)r.height);
+    glUniform1f(glGetUniformLocation(r.bloom_prefilter_shader, "uThreshold"), r.bloom_threshold);
+    glUniform1f(glGetUniformLocation(r.bloom_prefilter_shader, "uKnee"), r.bloom_knee);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r.scene_target.color);
+    pix_draw_fullscreen();
+
+    float tx = 1.0f / (float)r.bloom_a.width;
+    float ty = 1.0f / (float)r.bloom_a.height;
+    glUseProgram(r.bloom_blur_shader);
+    glUniform1i(glGetUniformLocation(r.bloom_blur_shader, "uSource"), 0);
+
+    pix_bind_framebuffer(r.bloom_b);
+    glUniform2f(glGetUniformLocation(r.bloom_blur_shader, "uDirection"), tx, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, r.bloom_a.color);
+    pix_draw_fullscreen();
+
+    pix_bind_framebuffer(r.bloom_a);
+    glUniform2f(glGetUniformLocation(r.bloom_blur_shader, "uDirection"), 0.0f, ty);
+    glBindTexture(GL_TEXTURE_2D, r.bloom_b.color);
+    pix_draw_fullscreen();
+
+    glEnable(GL_DEPTH_TEST);
+}
+
 static void pix__water_pass(pix_renderer& r, const mat4& view_proj) {
     if (!r.water_count || !r.water_shader) return;
-    static mat4 batch[256];
+    static mat4 batch[MAX_WATER_INSTANCES];
 
     glUseProgram(r.water_shader);
     glUniformMatrix4fv(glGetUniformLocation(r.water_shader, "uViewProj"), 1, GL_FALSE, view_proj.data);
     glUniform1f(glGetUniformLocation(r.water_shader, "uTime"), r.time);
+    glUniform1f(glGetUniformLocation(r.water_shader, "uBedDepth"), r.water_depth);
     glUniform3f(glGetUniformLocation(r.water_shader, "uShallowColor"),
                 r.water_shallow.x, r.water_shallow.y, r.water_shallow.z);
     glUniform3f(glGetUniformLocation(r.water_shader, "uDeepColor"),
@@ -693,7 +835,7 @@ static void pix__water_pass(pix_renderer& r, const mat4& view_proj) {
         idx mi = r.water_instances[i].mesh;
         size_t j = i;
         while (j < r.water_count && r.water_instances[j].mesh == mi) {
-            batch[j - i] = r.water_instances[j].trainsform;
+            batch[j - i] = r.water_instances[j].transform;
             j++;
         }
         int n = (int)(j - i);
@@ -727,17 +869,17 @@ static void pix__sky_pass(pix_renderer& r, const mat4& view_proj) {
     glUniform3f(glGetUniformLocation(r.sky_shader, "uCameraPos"),
                 r.camera_position.x, r.camera_position.y, r.camera_position.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uSunDir"),
-                r.sun_direction.x, r.sun_direction.y, r.sun_direction.z);
+                r.sun.direction.x, r.sun.direction.y, r.sun.direction.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uSunColor"),
-                r.sun_color.x, r.sun_color.y, r.sun_color.z);
+                r.sun.color.x, r.sun.color.y, r.sun.color.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uSkyZenith"),
-                r.sky_zenith.x, r.sky_zenith.y, r.sky_zenith.z);
+                r.sky.zenith.x, r.sky.zenith.y, r.sky.zenith.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uSkyHorizon"),
-                r.sky_horizon.x, r.sky_horizon.y, r.sky_horizon.z);
+                r.sky.horizon.x, r.sky.horizon.y, r.sky.horizon.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uGroundColor"),
-                r.ground_color.x, r.ground_color.y, r.ground_color.z);
+                r.sky.diffuse_down.x, r.sky.diffuse_down.y, r.sky.diffuse_down.z);
     glUniform3f(glGetUniformLocation(r.sky_shader, "uFogColor"),
-                r.fog_color.x, r.fog_color.y, r.fog_color.z);
+                r.sky.fog.x, r.sky.fog.y, r.sky.fog.z);
     pix_draw_fullscreen();
 
     glEnable(GL_DEPTH_TEST);
@@ -756,7 +898,11 @@ static void pix__post_pass(pix_renderer& r) {
     glUniform1f(glGetUniformLocation(r.post_shader, "uSaturation"), r.saturation);
     glUniform1f(glGetUniformLocation(r.post_shader, "uVignette"), r.vignette);
     glUniform1f(glGetUniformLocation(r.post_shader, "uSharpen"), r.sharpen);
+    glUniform1f(glGetUniformLocation(r.post_shader, "uBloomStrength"), r.bloom_strength);
+    glUniform1i(glGetUniformLocation(r.post_shader, "uBloom"), 1);
 
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, r.bloom_a.color);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, r.scene_target.color);
     pix_draw_fullscreen();
@@ -769,6 +915,8 @@ static void end_frame(pix_renderer& r, bool clear_instances) {
 
     // group instances so each (mesh, material) run is one instanced draw
     pix__sort_instances(r.instances, r.renderable_count);
+    // and reduce this frame's lights to the handful a fragment will evaluate
+    pix_lights_pack(r.lights, r.camera_position);
 
     if (r.effects) pix__shadow_pass(r);
 
@@ -785,6 +933,7 @@ static void end_frame(pix_renderer& r, bool clear_instances) {
     glUniformMatrix4fv(glGetUniformLocation(r.shader, "uViewProj"), 1, GL_FALSE, vp.data);
     glUniform1i(glGetUniformLocation(r.shader, "uTex"), 0);
     pix__set_lighting(r, r.shader);
+    pix__bind_lights(r, r.shader);
     pix__bind_shadow(r, r.shader);
     pix__draw_instanced(r, r.shader, true);
 
@@ -793,6 +942,7 @@ static void end_frame(pix_renderer& r, bool clear_instances) {
         glUniformMatrix4fv(glGetUniformLocation(r.skinned_shader, "uViewProj"), 1, GL_FALSE, vp.data);
         glUniform1i(glGetUniformLocation(r.skinned_shader, "uTex"), 0);
         pix__set_lighting(r, r.skinned_shader);
+        pix__bind_lights(r, r.skinned_shader);
         pix__bind_shadow(r, r.skinned_shader);
         pix__draw_skinned(r, r.skinned_shader, true);
     }
@@ -800,7 +950,10 @@ static void end_frame(pix_renderer& r, bool clear_instances) {
     pix__water_pass(r, vp);
 
     glBindVertexArray(0);
-    if (r.effects) pix__post_pass(r);
+    if (r.effects) {
+        pix__bloom_pass(r);
+        pix__post_pass(r);
+    }
 
     if (clear_instances) { r.renderable_count = 0; r.animated_count = 0; r.water_count = 0; }
 }

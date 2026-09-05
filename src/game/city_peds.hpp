@@ -26,8 +26,11 @@
 
 #define PED_WALK_POSES   8
 #define PED_IDLE_POSES   3
-#define PED_WALK_SPEED   1.45f
-#define PED_CROSS_SPEED  2.10f
+// Faster than a real pedestrian for the same reason the player is, and kept
+// well under the player's walk so that overtaking a crowd still reads as
+// overtaking it.
+#define PED_WALK_SPEED   1.85f
+#define PED_CROSS_SPEED  2.75f
 
 #define PED_STATE_WALK   0
 #define PED_STATE_WAIT   1   // on the kerb, waiting for the traffic to stop
@@ -48,6 +51,8 @@ struct city_ped {
     uint8_t material;        // which outfit tint of that rig
     uint8_t pose;
     uint8_t state;
+    uint8_t bank_pose;       // which standing pose a waiting one holds
+    float   height;          // multiplier on the rig's own scale
     float   lateral;         // offset from the cell centreline, so they do not single-file
     float   stuck;
 };
@@ -57,10 +62,16 @@ struct city_pose_bank {
     animator  source;
     animation walk[PED_WALK_POSES];
     animation idle[PED_IDLE_POSES];
+    // A second standing cycle. Everyone waiting at a crossing holding the same
+    // pose is as obvious as everyone walking in step, and it is more obvious,
+    // because a queue at a kerb is exactly where the eye stops to look.
+    animation stand[PED_IDLE_POSES];
     float     walk_duration;
     float     idle_duration;
+    float     stand_duration;
     idx       walk_clip;
     idx       idle_clip;
+    idx       stand_clip;
     bool      ready;
 };
 
@@ -94,10 +105,12 @@ static void city_peds_init(city_peds& p, pix_data_loader& loader, const city_cat
             p.bank_count++;                    // keep bank indices aligned with characters
             continue;
         }
-        bank.walk_clip = ch.clips[CLIP_WALK] != (idx)-1 ? ch.clips[CLIP_WALK] : 0;
-        bank.idle_clip = ch.clips[CLIP_IDLE] != (idx)-1 ? ch.clips[CLIP_IDLE] : bank.walk_clip;
-        bank.walk_duration = animator_duration(bank.source, bank.walk_clip);
-        bank.idle_duration = animator_duration(bank.source, bank.idle_clip);
+        bank.walk_clip  = ch.clips[CLIP_WALK] != (idx)-1 ? ch.clips[CLIP_WALK] : 0;
+        bank.idle_clip  = ch.clips[CLIP_IDLE] != (idx)-1 ? ch.clips[CLIP_IDLE] : bank.walk_clip;
+        bank.stand_clip = ch.clips[CLIP_TALK] != (idx)-1 ? ch.clips[CLIP_TALK] : bank.idle_clip;
+        bank.walk_duration  = animator_duration(bank.source, bank.walk_clip);
+        bank.idle_duration  = animator_duration(bank.source, bank.idle_clip);
+        bank.stand_duration = animator_duration(bank.source, bank.stand_clip);
         bank.ready = true;
         p.bank_count++;
     }
@@ -118,21 +131,22 @@ static void city__bank_update(city_pose_bank& bank, float time) {
         float phase = time + idur * ((float)i / (float)PED_IDLE_POSES);
         animator_sample(bank.source, bank.idle_clip, phase, &bank.idle[i]);
     }
+
+    float sdur = bank.stand_duration > 0.01f ? bank.stand_duration : 1.0f;
+    for (int i = 0; i < PED_IDLE_POSES; i++) {
+        float phase = time + sdur * ((float)i / (float)PED_IDLE_POSES);
+        animator_sample(bank.source, bank.stand_clip, phase, &bank.stand[i]);
+    }
 }
 
 // Where inside a cell a person walks. Keeping a fixed lateral offset per
 // pedestrian is what stops a pavement turning into a single file queue.
 static vec3 city__ped_target(const city_world& w, const city_ped& ped) {
-    vec3 centre = cell_centre(ped.next_x, ped.next_z);
+    vec3 centre;
     int dx = ped.next_x - ped.node_x, dz = ped.next_z - ped.node_z;
     vec3 travel = v3norm(v3((float)dx, 0.0f, (float)dz));
 
-    // Buildings now take the back of a pavement cell, so the walkable strip is
-    // the SIDEWALK_WIDTH nearest the kerb. Pull the line out to sit in it.
-    const city_cell& c = city_at(w, ped.next_x, ped.next_z);
-    if (c.kind == CELL_SIDEWALK && c.kerb != DIR_NONE)
-        centre = v3add(centre, v3scale(dir_to_vec(c.kerb), LOT_LINE_SHIFT * 0.5f));
-
+    centre = city_stand_point(w, ped.next_x, ped.next_z);
     return v3add(centre, v3scale(dir_right(travel), ped.lateral));
 }
 
@@ -223,13 +237,21 @@ static int city_peds_spawn(city_peds& p, const city_world& w, const city_catalog
     memset(&ped, 0, sizeof(ped));
     ped.node_x = ped.next_x = cx;
     ped.node_z = ped.next_z = cz;
-    ped.position = cell_centre(cx, cz);
-    ped.lateral = rng_range(p.random, -SIDEWALK_WIDTH * 0.32f, SIDEWALK_WIDTH * 0.32f);
+    ped.position = city_stand_point(w, cx, cz);
+    // spread across the clear strip only, less their own shoulders
+    float spread = (SIDEWALK_WIDTH - KERB_STRIP) * 0.5f - 0.35f;
+    ped.lateral = rng_range(p.random, -spread, spread);
     ped.character = (uint8_t)(rng_u32(p.random) % cat.character_count);
     ped.material = (uint8_t)(rng_u32(p.random)
                              % (cat.characters[ped.character].material_count | 1u));
     ped.pose = (uint8_t)(rng_u32(p.random) % PED_WALK_POSES);
-    ped.speed = PED_WALK_SPEED * rng_range(p.random, 0.85f, 1.2f);
+    ped.bank_pose = (uint8_t)(rng_u32(p.random) % (PED_IDLE_POSES * 2));
+    // Adults are not all the same height, and a crowd of identical silhouettes
+    // is the first thing that gives a generated one away. Kept narrow: this is
+    // build variation, not a cast of giants and children.
+    ped.height = rng_range(p.random, 0.92f, 1.08f);
+    // and the taller ones cover ground slightly faster
+    ped.speed = PED_WALK_SPEED * ped.height * rng_range(p.random, 0.85f, 1.2f);
     ped.cross_dir = DIR_NONE;
     ped.active = true;
     city__ped_choose(ped, w, p.random);
@@ -344,15 +366,22 @@ static void city_peds_draw(const city_peds& p, const city_catalog& cat, pix_rend
         if (!frustum_test_sphere(view, v3(ped.position.x, ped.position.y + 0.9f, ped.position.z), 1.4f))
             continue;
 
-        // standing at a kerb waiting for the lights is an idle, not a walk
-        const animation& pose = (ped.state == PED_STATE_WAIT)
-            ? bank.idle[ped.pose % PED_IDLE_POSES]
-            : bank.walk[ped.pose % PED_WALK_POSES];
+        // Standing at a kerb waiting for the lights is an idle, not a walk -
+        // and which idle is picked per person, so a queue is a group of people
+        // rather than one person rendered six times.
+        const animation* pose;
+        if (ped.state == PED_STATE_WAIT) {
+            int slot = ped.bank_pose % PED_IDLE_POSES;
+            pose = (ped.bank_pose < PED_IDLE_POSES) ? &bank.idle[slot] : &bank.stand[slot];
+        } else {
+            pose = &bank.walk[ped.pose % PED_WALK_POSES];
+        }
 
         pix_render_instance inst = {};
         inst.mesh = ch.mesh;
         inst.material = ch.materials[ped.material % ch.material_count];
-        inst.trainsform = mat4_trs_y(ped.position, ped.yaw + ch.yaw_offset, ch.scale);
-        push_animated_instance(renderer, inst, pose);
+        inst.transform = mat4_trs_y(ped.position, ped.yaw + ch.yaw_offset,
+                                     ch.scale * ped.height);
+        push_animated_instance(renderer, inst, *pose);
     }
 }

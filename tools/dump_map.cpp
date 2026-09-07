@@ -10,6 +10,8 @@
 // for reading in a terminal; the PNG is for seeing the shape of the whole city
 // at once, which no in-game camera can do.
 #define _CRT_SECURE_NO_WARNINGS
+// street-by-street generation log; the tool is where this is worth having
+#define CITY_MAP_VERBOSE
 #include <stdio.h>
 #include <stdlib.h>
 #include "../src/game/city_map.hpp"
@@ -123,10 +125,66 @@ static void draw_map(const char* path) {
     }
 
     if (png_write_rgb(path, image, MAP_SIZE, MAP_SIZE))
-        printf("wrote %s  (%d x %d, %d m per pixel)\n",
+    printf("wrote %s  (%d x %d, %d m per pixel)\n",
                path, MAP_SIZE, MAP_SIZE, (int)(CITY_TILE / MAP_CELL_PX));
     else
         printf("could not write %s\n", path);
+}
+
+
+// ---- the archipelago, island by island ----
+//
+// The one report that says whether a generation run actually worked: an
+// island with land but no road on it is one the causeway pass failed to
+// reach, and every street on it was then pruned as unreachable. That is
+// invisible in the picture unless you already know what you are looking at.
+static void report_islands(const city_world& w) {
+    // Where to stand to look at the things that are hard to find from the
+    // air: the parks are a handful of blocks in a city of 139, and a bridge
+    // is four cells of a 112 x 112 grid. Printed as PIX_SPAWN arguments so
+    // checking one is a copy and paste rather than a walk.
+    printf("\nparks (PIX_SPAWN=x,z at the middle of each)\n");
+    int parks = 0;
+    for (size_t bi = 0; bi < world.block_count; bi++) {
+        const city_block& b = world.blocks[bi];
+        if (b.zone != ZONE_PARK) continue;
+        printf("  PIX_SPAWN=%d,%d   %d x %d cells\n",
+               (b.x0 + b.x1) / 2, (b.z0 + b.z1) / 2, b.x1 - b.x0 + 1, b.z1 - b.z0 + 1);
+        parks++;
+    }
+    if (!parks) printf("  (none)\n");
+
+    printf("\nbridges\n");
+    int bridges = 0;
+    for (int z = 1; z < CITY_CELLS - 1 && bridges < 12; z++)
+        for (int x = 1; x < CITY_CELLS - 1 && bridges < 12; x++) {
+            const city_cell& c = city_at(world, x, z);
+            if (!(c.flags & CELLF_BRIDGE)) continue;
+            // only the first cell of each run, so one crossing prints once
+            if (city_at(world, x - 1, z).flags & CELLF_BRIDGE) continue;
+            if (city_at(world, x, z - 1).flags & CELLF_BRIDGE) continue;
+            printf("  PIX_SPAWN=%d,%d\n", x, z);
+            bridges++;
+        }
+    if (!bridges) printf("  (none)\n");
+
+    printf("\nislands\n");
+    for (size_t k = 0; k < w.island_count; k++) {
+        const city_island& is = w.islands[k];
+        int land = 0, road = 0, bridge = 0;
+        for (int z = 0; z < CITY_CELLS; z++)
+            for (int x = 0; x < CITY_CELLS; x++) {
+                const city_cell& c = city_at(w, x, z);
+                if (c.kind == CELL_WATER) continue;
+                if (city__island_at(w, x, z) != (int)k) continue;
+                land++;
+                if (c.kind == CELL_ROAD) road++;
+                if (c.flags & CELLF_BRIDGE) bridge++;
+            }
+        printf("  %2zu  centre %5.1f,%5.1f  r %5.1f  %s  land %5d  road %5d  bridge %3d%s\n",
+               k, is.cx, is.cz, is.radius, is.plan == ISLAND_GRID ? "grid " : "lanes",
+               land, road, bridge, (land > 60 && road == 0) ? "   << UNREACHED" : "");
+    }
 }
 
 int main(int argc, char** argv) {
@@ -181,6 +239,8 @@ int main(int argc, char** argv) {
            world.block_count, world.prop_count, world.water_count,
            physics.static_count, world.lamp_count);
     printf("road cells %zu  walk cells %zu\n", world.road_cell_count, world.walk_cell_count);
+
+    report_islands(world);
 
     printf("\nmap colours: slate downtown, pale blue commercial, sandstone residential,\n"
            "             brick suburb, grey industrial, green parks and open ground;\n"

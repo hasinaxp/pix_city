@@ -177,6 +177,89 @@ static void pix_daylight_at(float hour, pix_sun* out_sun, pix_sky* out_sky,
     out_sky->fog_density  = A.sky.fog_density + (B.sky.fog_density - A.sky.fog_density) * t;
 }
 
+// ---- weather ----
+//
+// Weather is a filter over the hour, not a second lighting setup. Every key in
+// PIX_DAY is a clear sky; a cloud deck is what happens to that clear sky when
+// something grey is put between it and the sun, and that is a transformation
+// the same at every hour: the sun loses most of its strength and all of its
+// colour, the dome flattens toward the grey of the cloud base, the fog thickens
+// and the camera opens up to compensate. Doing it this way means a new hour
+// keyframe is automatically correct in the rain, and an overcast noon and an
+// overcast dusk stay as different from each other as the clear ones are.
+//
+// `overcast` is the cloud deck, 0..1. `rain` is how hard it is falling, which
+// only ever exists under cloud; `wetness` lags rain so the ground stays shiny
+// for a while after it stops.
+struct pix_weather {
+    float overcast;
+    float rain;
+    float wetness;
+};
+
+// The grey a thick cloud base scatters. Slightly blue, because it is still lit
+// by a sky - a neutral grey here is what makes overcast renders look dead.
+static const vec3 PIX_OVERCAST_GREY = { 0.44f, 0.47f, 0.52f };
+
+// Bends a clear-sky setup toward that cloud deck. Applied after
+// pix_daylight_at, so the hour is chosen first and the weather then acts on it.
+static void pix_weather_apply(const pix_weather& w, pix_sun* sun, pix_sky* sky,
+                              float* exposure) {
+    float o = w.overcast < 0.0f ? 0.0f : (w.overcast > 1.0f ? 1.0f : w.overcast);
+    if (o <= 0.0f) return;
+
+    // The sun behind cloud is not a shadow-casting disc any more, it is the
+    // brightest part of a uniform dome. Killing most of its radiance is what
+    // makes the shadows go away, which is the single strongest cue that the
+    // sky has closed over.
+    float lum = sun->color.x * 0.2126f + sun->color.y * 0.7152f + sun->color.z * 0.0722f;
+    vec3 grey_sun = v3(lum, lum, lum);
+    sun->color = v3scale(pix__mix3(sun->color, grey_sun, o * 0.85f), 1.0f - o * 0.88f);
+
+    // How bright the sky is at this hour at all.
+    //
+    // The deck colour above is the grey of a cloud base at *midday*. Used as
+    // an absolute it turns an overcast midnight into an overcast noon: the
+    // dome is a fixed mid grey, the exposure is still the one night needs, and
+    // the result is a city at half past nine at night lit like an afternoon.
+    // A cloud base is only ever as bright as the sky lighting it, so the grey
+    // is scaled by what this hour clear sky was already doing - which makes
+    // one deck colour work at every hour instead of only at the one it was
+    // picked for.
+    float sky_lum = sky->horizon.x * 0.2126f + sky->horizon.y * 0.7152f
+                  + sky->horizon.z * 0.0722f;
+    float k = sky_lum / 0.66f;              // 0.66 is that midday horizon
+    if (k > 1.4f) k = 1.4f;
+    if (k < 0.015f) k = 0.015f;
+    vec3 grey = v3scale(PIX_OVERCAST_GREY, k);
+
+    // The dome loses its gradient: overcast sky is nearly the same brightness
+    // straight up as at the horizon, which is why it has no depth to it.
+    vec3 deck_up   = v3scale(grey, 0.62f);
+    vec3 deck_horiz = grey;
+    float dim = 1.0f - o * 0.35f;
+    sky->zenith  = pix__mix3(sky->zenith,  v3scale(deck_up, dim), o);
+    sky->horizon = pix__mix3(sky->horizon, v3scale(deck_horiz, dim), o);
+    sky->ground  = pix__mix3(sky->ground,  v3scale(grey, 0.18f * dim), o);
+
+    // The irradiance the sun stopped delivering does not all vanish - cloud
+    // scatters a good part of it back down as a huge soft source. Overcast is
+    // dimmer than clear noon, but nothing like as dim as the sun term alone
+    // would suggest, and this is the term that keeps a rainy street readable.
+    float up_lum = sky->diffuse_up.x * 0.2126f + sky->diffuse_up.y * 0.7152f + sky->diffuse_up.z * 0.0722f;
+    vec3 flat_up = v3scale(PIX_OVERCAST_GREY, up_lum * 1.55f + 0.02f * k);
+    sky->diffuse_up   = pix__mix3(sky->diffuse_up, flat_up, o);
+    sky->diffuse_down = pix__mix3(sky->diffuse_down, v3scale(flat_up, 0.45f), o);
+
+    // Rain is haze you can see through less far.
+    vec3 fog_grey = pix__mix3(sky->fog, grey, 0.75f);
+    sky->fog = pix__mix3(sky->fog, fog_grey, o);
+    sky->fog_density *= 1.0f + o * 1.8f + w.rain * 1.6f;
+
+    // and the eye opens up under it, the way it does walking out into a grey day
+    *exposure *= 1.0f + o * 0.30f;
+}
+
 // How much artificial light the world should be running, 0 by day and 1 at
 // night. Street lamps and headlights fade in and out on this rather than
 // switching, so dusk is a gradient instead of an event.
@@ -214,9 +297,19 @@ static void pix_lights_add(pix_light_list& list, const pix_light& light) {
 }
 
 // Chooses the lights this frame will actually shade with and packs them.
-// Ordering is by how much of the light reaches the camera at all - distance
-// alone would drop a bright lamp just out of range in favour of a dim one
-// underfoot.
+//
+// Ordering is by how close a light's sphere of influence comes to the camera,
+// with a small bonus for brightness - a bright lamp just out of range is worth
+// more than a dim one underfoot, but only a little more.
+//
+// The weight on that bonus is the whole subtlety here. Punctual intensities in
+// this world are candela-like and run into the hundreds, so scoring them
+// against a distance in metres one-for-one does not rank lights, it ranks
+// their wattage: at half a unit per candela a headlight two hundred metres
+// away outscored a street lamp directly overhead, every slot in the frame went
+// to traffic somewhere across the city, and not one of the four hundred lamps
+// in the city lit anything at all. A hundredth of a candela per metre keeps
+// the tie-break it was there for and takes away its ability to win outright.
 static void pix_lights_pack(pix_light_list& list, vec3 eye) {
     static float score[MAX_SCENE_LIGHTS];
     static int   order[MAX_SCENE_LIGHTS];
@@ -228,7 +321,7 @@ static void pix_lights_pack(pix_light_list& list, vec3 eye) {
         float d = sqrtf(dx * dx + dy * dy + dz * dz);
         float reach = d - l.radius;               // negative once the eye is inside it
         float power = l.color.x + l.color.y + l.color.z;
-        score[i] = reach - power * 0.5f;           // lower is more worth keeping
+        score[i] = reach - power * 0.01f;          // lower is more worth keeping
         order[i] = (int)i;
     }
 

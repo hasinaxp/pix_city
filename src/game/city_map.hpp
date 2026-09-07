@@ -1,5 +1,6 @@
 #pragma once
 #include <string.h>
+#include <stdio.h>
 #include "../core/random.hpp"
 #include "../core/physics.hpp"
 #include "city_config.hpp"
@@ -49,6 +50,15 @@ struct city_cell {
 #define CELLF_CROSSING 0x04   // road cell carrying a pedestrian crossing
 #define CELLF_YARD     0x08   // lot cell kept clear as a garden
 #define CELLF_BRIDGE   0x10   // road cell carried over water on a deck
+// Part of a whole block given over to a park - as opposed to the ribbon of
+// green round every coast, which is park too but is not a place. See
+// city__make_parks: this is what earns a railing round it, paths across it and
+// a playground in the middle of it.
+#define CELLF_PARKBLOCK 0x20
+// Kept clear for something the park pass has already placed there. Set before
+// the scatter pass runs, which is the only way a swing set does not end up
+// with a tree growing through it.
+#define CELLF_FEATURE   0x40
 
 // One placed piece of scenery. Kept as loose transform components rather than a
 // matrix: at ninety thousand of them the memory saved is worth more than the
@@ -58,6 +68,7 @@ struct city_prop {
     float yaw;
     float scale;
     float scale_y;      // 0 means "same as scale"
+    float scale_x;      // across the model own facade; 0 means "same as scale"
     idx   mesh;
     idx   lod_mesh;     // drawn instead past LOD_DISTANCE; (idx)-1 for none
     idx   material;
@@ -68,6 +79,41 @@ struct city_prop {
 struct city_block {
     int     x0, z0, x1, z1;    // inclusive cell bounds, road lines excluded
     uint8_t zone;
+};
+
+// A house the player can walk into - see city_house.hpp for the interior
+// itself. Only residential and suburb buildings get one; a downtown tower or
+// a corner shop has no home to generate.
+struct city_house {
+    vec3     door_pos;   // outdoor spot the player stands at to enter, or arrives at leaving
+    float    exit_yaw;   // which way that spot faces - into the street, away from the door
+    uint32_t id;         // stable per building, seeds its interior - see city_house_layout
+};
+#define CITY_MAX_HOUSES 600
+
+// ---- the archipelago ----
+//
+// The city is not one landmass with a river through it any more, it is a
+// handful of islands in open water joined by causeways - which is the shape
+// the whole genre uses, and for a good reason: an island gives a district a
+// hard edge and a character of its own, and the drive between two of them is
+// the thing a river crossing can only hint at.
+//
+// Each island carries its own street plan and its own idea of what it is, so
+// "downtown" is a place you cross water to reach rather than a radius from
+// the middle of a square grid.
+#define CITY_MAX_ISLANDS 12
+
+#define ISLAND_GRID   0   // rectilinear blocks: downtown, commercial, industry
+#define ISLAND_LANES  1   // rings following the coast, joined by spokes: suburbs
+
+struct city_island {
+    float   cx, cz;       // centre, in cells
+    float   radius;       // mean radius, in cells - the coast wanders either side
+    float   wobble[3];    // phase of the three harmonics that shape the coastline
+    uint8_t core_zone;    // what the middle of it is
+    uint8_t edge_zone;    // what its rim is
+    uint8_t plan;         // ISLAND_*
 };
 
 struct city_world {
@@ -85,6 +131,9 @@ struct city_world {
     city_block blocks[CITY_MAX_BLOCKS];
     size_t     block_count;
 
+    city_house houses[CITY_MAX_HOUSES];
+    size_t     house_count;
+
     // Every street lamp head in the city. Stored apart from the props because
     // these are not scenery - after dusk each one is a light the renderer has to
     // be handed, and a frame only wants the handful near the camera.
@@ -96,6 +145,14 @@ struct city_world {
     size_t   road_cell_count;
     uint32_t walk_cells[CITY_CELLS * CITY_CELLS];
     size_t   walk_cell_count;
+
+    city_island islands[CITY_MAX_ISLANDS];
+    size_t      island_count;
+    // How many cells inland this one is: 0 for water, 1 for a cell on the
+    // shore, upward from there. Built once by city__measure_shore and then
+    // used for everything that wants to know where the coast is - the coast
+    // road, which zone a block gets, where the promenade trees go.
+    uint8_t  shore[CITY_CELLS * CITY_CELLS];
 
     uint32_t seed;
 };
@@ -191,13 +248,15 @@ static idx city_road_mesh(const city_catalog& cat, uint8_t mask, bool crossing, 
 // ---- prop emission ----
 
 static void city__prop(city_world& w, const city_model* m, vec3 position, float yaw,
-                       float scale, float fade, idx lod_mesh = (idx)-1, float scale_y = 0.0f) {
+                       float scale, float fade, idx lod_mesh = (idx)-1, float scale_y = 0.0f,
+                       float scale_x = 0.0f) {
     if (!m || m->mesh == (idx)-1 || w.prop_count >= CITY_MAX_PROPS) return;
     city_prop& p = w.props[w.prop_count++];
     p.position = position;
     p.yaw = yaw;
     p.scale = scale;
     p.scale_y = scale_y;
+    p.scale_x = scale_x;
     p.mesh = m->mesh;
     p.lod_mesh = lod_mesh;
     p.material = m->material;
@@ -207,8 +266,21 @@ static void city__prop(city_world& w, const city_model* m, vec3 position, float 
     // that a skyscraper never pops while a bin never survives too long
     vec3 e = v3sub(m->bounds_max, m->bounds_min);
     float sy = scale_y > 0.0f ? scale_y : scale;
-    float rx = e.x * 0.5f * scale, rz = e.z * 0.5f * scale, ry = e.y * 0.5f * sy;
+    float sx = scale_x > 0.0f ? scale_x : scale;
+    float rx = e.x * 0.5f * sx, rz = e.z * 0.5f * scale, ry = e.y * 0.5f * sy;
     p.radius = sqrtf(rx * rx + ry * ry + rz * rz);
+
+    // The rest of a model painted with more than one texture, at the same
+    // transform - a tree's leaves following its trunk. They are ordinary
+    // props from here on, so they cull, fade and batch exactly like the
+    // piece they belong to; nothing downstream needs to know.
+    for (int i = 0; i < m->part_count && w.prop_count < CITY_MAX_PROPS; i++) {
+        city_prop& q = w.props[w.prop_count++];
+        q = p;
+        q.mesh = m->part_mesh[i];
+        q.material = m->part_material[i];
+        q.lod_mesh = (idx)-1;
+    }
 }
 
 // a mesh chosen by hand rather than through the catalogue tables
@@ -220,6 +292,7 @@ static void city__prop_mesh(city_world& w, idx mesh, idx material, vec3 position
     p.yaw = yaw;
     p.scale = scale;
     p.scale_y = scale_y;
+    p.scale_x = 0.0f;
     p.mesh = mesh;
     p.lod_mesh = (idx)-1;
     p.material = material;
@@ -242,6 +315,65 @@ static void city__prop_mesh(city_world& w, idx mesh, idx material, vec3 position
 static vec3 city__rot_y(vec3 v, float yaw) {
     float c = cosf(yaw), s = sinf(yaw);
     return v3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+// ---- colliders ----
+//
+// A static collider off the model's own measured box, which is the only
+// version of this that stays right when the art changes.
+//
+// Two things it gets right that a hand-typed half-extent cannot. The box is
+// the model's, so re-scaling a set (or nudging one model's bounds in the
+// collider editor) moves the collider with it. And it is placed at the
+// model's *centre*, not at its origin - several pieces in this art set are
+// authored well off their own origin (the church sits 9 m up its own Z axis),
+// and a collider centred on the origin for one of those is a wall standing
+// beside the building rather than inside it.
+//
+// `shrink` pulls the footprint in. Anything a player is meant to be able to
+// brush past - a bench, a fence post - wants a collider slightly smaller than
+// its silhouette, because the alternative is being stopped by air.
+static void city__collide_model(phys_world& phys, const city_model* m, vec3 pos, float yaw,
+                                float scale, float scale_y = 0.0f, float shrink = 1.0f,
+                                float scale_x = 0.0f) {
+    if (!m) return;
+    float sy = scale_y > 0.0f ? scale_y : scale;
+    float sx = scale_x > 0.0f ? scale_x : scale;
+    vec3 e = v3sub(m->bounds_max, m->bounds_min);
+    vec3 c = v3scale(v3add(m->bounds_min, m->bounds_max), 0.5f);
+    vec3 at = v3add(pos, city__rot_y(v3(c.x * sx, 0.0f, c.z * scale), yaw));
+    at.y = pos.y + m->bounds_min.y * sy;
+    phys_add_static_prop(phys, at, yaw,
+                         v2(e.x * 0.5f * sx * shrink, e.z * 0.5f * scale * shrink),
+                         e.y * sy);
+}
+
+// ---- barrier runs ----
+//
+// A wall or a railing laid along one edge of a cell, as two half-tile pieces
+// end to end rather than one piece stretched across the cell. Stretching is
+// what turned every fence in the city into a two-storey panel: these models
+// are barely longer than they are tall, so the only scale that makes one a
+// fence is its own.
+//
+// The collider is one box for the whole edge, not one per piece. A run of
+// eight-metre edges each with its own box is eight times the broadphase work
+// for a wall that is continuous anyway.
+static void city__run_barrier(city_world& w, phys_world& phys, const city_model* m,
+                              vec3 edge, int along, float height, float fade) {
+    if (!m) return;
+    vec3 dir = dir_to_vec(along);
+    float yaw = dir_to_yaw_along(along);
+    for (int half = -1; half <= 1; half += 2) {
+        vec3 q = v3add(edge, v3scale(dir, (float)half * CITY_TILE * 0.25f));
+        city__prop(w, m, q, yaw, m->scale, fade);
+    }
+    vec3 lo = v3(edge.x - fabsf(dir.x) * CITY_TILE * 0.5f - fabsf(dir.z) * 0.25f, edge.y,
+                 edge.z - fabsf(dir.z) * CITY_TILE * 0.5f - fabsf(dir.x) * 0.25f);
+    vec3 hi = v3(edge.x + fabsf(dir.x) * CITY_TILE * 0.5f + fabsf(dir.z) * 0.25f,
+                 edge.y + height,
+                 edge.z + fabsf(dir.z) * CITY_TILE * 0.5f + fabsf(dir.x) * 0.25f);
+    phys_add_static_box(phys, lo, hi);
 }
 
 static void city__parked_car(city_world& w, const city_catalog& cat, phys_world& phys,
@@ -272,35 +404,190 @@ static void city__parked_car(city_world& w, const city_catalog& cat, phys_world&
     phys_add_static_prop(phys, at, chassis_yaw, v2(vm.half_width, vm.half_length), vm.height);
 }
 
-// ---- pass 0: the river ----
+// ---- pass 0: the coastline ----
+//
+// The islands are laid out by hand rather than scattered at random, because
+// the arrangement is the map: a big central island you start on, a dense grid
+// across the water to the west, a low winding suburb to the south west, a
+// quiet residential rock to the north east, industry out east, docks to the
+// south, and a couple of islets in between with nothing on them. Random
+// placement gives an archipelago; this gives *a city*.
+//
+// The seed still moves every island a little and reshapes every coastline, so
+// two seeds are recognisably the same city and not the same map.
+struct city_island_plan {
+    float   cx, cz, radius;
+    uint8_t core_zone, edge_zone, plan;
+};
 
-// Carves a meandering channel across the map. The centreline is a sum of two
-// sines rather than a random walk so it stays smooth - a river that wobbles
-// per-cell looks like noise, and the banks come out ragged.
-static void city__carve_river(city_world& w, rng& r) {
-    bool along_x = rng_chance(r, 0.5f);
+static const city_island_plan CITY_ISLAND_PLAN[] = {
+    // centre x, centre z, radius (all as a fraction of the grid)
+    //                      core              rim               plan
+    { 0.62f, 0.48f, 0.200f, ZONE_DOWNTOWN,    ZONE_COMMERCIAL,  ISLAND_GRID  },  // downtown
+    { 0.19f, 0.28f, 0.150f, ZONE_COMMERCIAL,  ZONE_RESIDENTIAL, ISLAND_GRID  },  // west grid
+    { 0.17f, 0.77f, 0.155f, ZONE_SUBURB,      ZONE_SUBURB,      ISLAND_LANES },  // south west hills
+    { 0.81f, 0.15f, 0.105f, ZONE_RESIDENTIAL, ZONE_SUBURB,      ISLAND_LANES },  // north east
+    { 0.93f, 0.56f, 0.098f, ZONE_INDUSTRIAL,  ZONE_INDUSTRIAL,  ISLAND_GRID  },  // east works
+    { 0.54f, 0.89f, 0.100f, ZONE_COMMERCIAL,  ZONE_INDUSTRIAL,  ISLAND_GRID  },  // south docks
+    { 0.86f, 0.90f, 0.072f, ZONE_INDUSTRIAL,  ZONE_SUBURB,      ISLAND_GRID  },  // south east
+    { 0.36f, 0.07f, 0.055f, ZONE_RESIDENTIAL, ZONE_PARK,        ISLAND_LANES },  // north rock
+    { 0.42f, 0.34f, 0.028f, ZONE_PARK,        ZONE_PARK,        ISLAND_LANES },  // islet
+    { 0.38f, 0.62f, 0.026f, ZONE_PARK,        ZONE_PARK,        ISLAND_LANES },  // islet
+};
+#define CITY_ISLAND_PLAN_COUNT ((int)(sizeof(CITY_ISLAND_PLAN) / sizeof(CITY_ISLAND_PLAN[0])))
 
-    float phase_a = rng_range(r, 0.0f, 6.28f);
-    float phase_b = rng_range(r, 0.0f, 6.28f);
-    float amp_a   = rng_range(r, 6.0f, 13.0f);
-    float amp_b   = rng_range(r, 2.5f, 6.0f);
-    float centre  = CITY_CELLS * 0.5f + rng_range(r, -10.0f, 10.0f);
-    float width   = rng_range(r, (float)RIVER_MIN_WIDTH, (float)RIVER_MAX_WIDTH);
+// How far out the coast reaches at one bearing. Three harmonics is the whole
+// trick: one lobe makes a peanut, three make a coastline with headlands and
+// bays that still closes on itself smoothly, which a per-cell noise never
+// does - that gives a fringe of loose rocks instead of a shore.
+static float city__island_reach(const city_island& is, float angle) {
+    return is.radius * (1.0f
+        + 0.20f * sinf(angle * 2.0f + is.wobble[0])
+        + 0.13f * sinf(angle * 3.0f + is.wobble[1])
+        + 0.08f * sinf(angle * 5.0f + is.wobble[2]));
+}
 
-    for (int t = 0; t < CITY_CELLS; t++) {
-        float u = (float)t;
-        float mid = centre + sinf(u * 0.055f + phase_a) * amp_a
-                           + sinf(u * 0.131f + phase_b) * amp_b;
-        float half = width * 0.5f + sinf(u * 0.083f) * 0.6f;
-
-        int lo = (int)floorf(mid - half), hi = (int)ceilf(mid + half);
-        for (int c = lo; c <= hi; c++) {
-            int x = along_x ? t : c;
-            int z = along_x ? c : t;
-            if (!city_in_bounds(x, z)) continue;
-            city_at(w, x, z).kind = CELL_WATER;
-        }
+// How far inside its island a point is, in cells, for the two islands that
+// claim it most strongly. Positive is land, negative is sea.
+//
+// The second value is what keeps the archipelago an archipelago. Taking only
+// the best of them means two islands placed near each other silently fuse
+// into one peanut-shaped lump, which is what the first version of this did to
+// four of the ten - and a district that has quietly grown onto its neighbour
+// is no longer a district. Where two islands both reach a cell, that cell is
+// water, so the overlap comes out as the channel between them instead.
+static void city__land_field(const city_world& w, float x, float z,
+                             float* out_best, float* out_second) {
+    float best = -1e9f, second = -1e9f;
+    for (size_t i = 0; i < w.island_count; i++) {
+        const city_island& is = w.islands[i];
+        float dx = x - is.cx, dz = z - is.cz;
+        float d = sqrtf(dx * dx + dz * dz);
+        float here = city__island_reach(is, atan2f(dz, dx)) - d;
+        if (here > best)        { second = best; best = here; }
+        else if (here > second) { second = here; }
     }
+    *out_best = best;
+    *out_second = second;
+}
+
+static void city__carve_islands(city_world& w, rng& r) {
+    w.island_count = 0;
+    for (int i = 0; i < CITY_ISLAND_PLAN_COUNT && w.island_count < CITY_MAX_ISLANDS; i++) {
+        const city_island_plan& p = CITY_ISLAND_PLAN[i];
+        city_island& is = w.islands[w.island_count++];
+        // A couple of cells of drift and a tenth of the radius: enough that no
+        // two seeds have the same shoreline, never enough to move a district
+        // to the other side of the map.
+        is.cx = p.cx * CITY_CELLS + rng_range(r, -2.5f, 2.5f);
+        is.cz = p.cz * CITY_CELLS + rng_range(r, -2.5f, 2.5f);
+        is.radius = p.radius * CITY_CELLS * rng_range(r, 0.92f, 1.08f);
+        for (int k = 0; k < 3; k++) is.wobble[k] = rng_range(r, 0.0f, 6.2831853f);
+        is.core_zone = p.core_zone;
+        is.edge_zone = p.edge_zone;
+        is.plan = p.plan;
+    }
+
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            float best, second;
+            city__land_field(w, (float)x + 0.5f, (float)z + 0.5f, &best, &second);
+            // land, unless a second island reaches here too - see city__land_field
+            bool land = best > 0.0f && second < 0.75f;
+            city_at(w, x, z).kind = land ? CELL_GROUND : CELL_WATER;
+        }
+
+    // Two cells of open water round the whole map, so the sea always runs off
+    // the edge of the world rather than an island being sliced flat by it.
+    for (int i = 0; i < CITY_CELLS; i++)
+        for (int k = 0; k < 2; k++) {
+            city_at(w, i, k).kind = CELL_WATER;
+            city_at(w, i, CITY_CELLS - 1 - k).kind = CELL_WATER;
+            city_at(w, k, i).kind = CELL_WATER;
+            city_at(w, CITY_CELLS - 1 - k, i).kind = CELL_WATER;
+        }
+}
+
+// Fills in city_world::shore: 0 for water, then 1, 2, 3 ... walking inland.
+// A two-pass chamfer over a grid this size is far cheaper than a queue and
+// gives the same answer for the small distances anything here asks about.
+static void city__measure_shore(city_world& w) {
+    // 255, not a name like FAR: <windows.h> already defines that one.
+    const uint8_t UNSET = 255;
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t i = (size_t)z * CITY_CELLS + x;
+            w.shore[i] = (w.cells[i].kind == CELL_WATER) ? 0 : UNSET;
+        }
+
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t i = (size_t)z * CITY_CELLS + x;
+            if (!w.shore[i]) continue;
+            uint8_t best = UNSET;
+            if (x > 0 && w.shore[i - 1] < best) best = w.shore[i - 1];
+            if (z > 0 && w.shore[i - CITY_CELLS] < best) best = w.shore[i - CITY_CELLS];
+            if (best < UNSET) w.shore[i] = (uint8_t)(best + 1);
+        }
+    for (int z = CITY_CELLS - 1; z >= 0; z--)
+        for (int x = CITY_CELLS - 1; x >= 0; x--) {
+            size_t i = (size_t)z * CITY_CELLS + x;
+            if (!w.shore[i]) continue;
+            uint8_t best = w.shore[i];
+            if (x + 1 < CITY_CELLS && w.shore[i + 1] + 1 < best) best = (uint8_t)(w.shore[i + 1] + 1);
+            if (z + 1 < CITY_CELLS && w.shore[i + CITY_CELLS] + 1 < best)
+                best = (uint8_t)(w.shore[i + CITY_CELLS] + 1);
+            w.shore[i] = best;
+        }
+}
+
+// A one-cell spit of land sticking into the sea, or a one-cell puddle in the
+// middle of a block, is noise: too small to build on, too small to sail
+// through, and it makes both the coast road and the block subdivision behave
+// badly. Anything with fewer than two like neighbours joins the majority.
+static void city__clean_coast(city_world& w) {
+    static uint8_t next[CITY_CELLS * CITY_CELLS];
+    for (int pass = 0; pass < 2; pass++) {
+        for (int z = 0; z < CITY_CELLS; z++)
+            for (int x = 0; x < CITY_CELLS; x++) {
+                size_t i = (size_t)z * CITY_CELLS + x;
+                uint8_t kind = w.cells[i].kind;
+                int like = 0, seen = 0;
+                for (int d = 0; d < 4; d++) {
+                    int nx = x + DIR_DX[d], nz = z + DIR_DZ[d];
+                    if (!city_in_bounds(nx, nz)) continue;
+                    seen++;
+                    if (city_at(w, nx, nz).kind == kind) like++;
+                }
+                next[i] = (seen >= 3 && like <= 1)
+                    ? (uint8_t)(kind == CELL_WATER ? CELL_GROUND : CELL_WATER) : kind;
+            }
+        for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++) w.cells[i].kind = next[i];
+    }
+    // never let the cleanup close the sea in from the edge
+    for (int i = 0; i < CITY_CELLS; i++)
+        for (int k = 0; k < 2; k++) {
+            city_at(w, i, k).kind = CELL_WATER;
+            city_at(w, i, CITY_CELLS - 1 - k).kind = CELL_WATER;
+            city_at(w, k, i).kind = CELL_WATER;
+            city_at(w, CITY_CELLS - 1 - k, i).kind = CELL_WATER;
+        }
+}
+
+// Which island a cell belongs to, or -1 out at sea. Answered from the same
+// field the coast was carved from rather than from a flood fill, so it is
+// still meaningful for a cell the cleanup pass moved by one.
+static int city__island_at(const city_world& w, int x, int z) {
+    float best = -1e9f;
+    int found = -1;
+    for (size_t i = 0; i < w.island_count; i++) {
+        const city_island& is = w.islands[i];
+        float dx = (float)x + 0.5f - is.cx, dz = (float)z + 0.5f - is.cz;
+        float d = sqrtf(dx * dx + dz * dz);
+        float here = city__island_reach(is, atan2f(dz, dx)) - d;
+        if (here > best) { best = here; found = (int)i; }
+    }
+    return found;
 }
 
 // A road that runs into the river becomes a bridge - but only if the same road
@@ -316,6 +603,13 @@ static void city__carve_river(city_world& w, rng& r) {
 static void city__build_bridges(city_world& w, const city_catalog& cat, phys_world& phys) {
     static bool deck[CITY_CELLS * CITY_CELLS];
     memset(deck, 0, sizeof(deck));
+
+    // A causeway between two islands has already claimed its cells and
+    // flagged them (see city__causeway); those need decking exactly like a
+    // crossing found below, and cannot be found by the search below because
+    // the water they span has already become road.
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++)
+        if (w.cells[i].flags & CELLF_BRIDGE) deck[i] = true;
 
     for (int z = 0; z < CITY_CELLS; z++)
         for (int x = 0; x < CITY_CELLS; x++) {
@@ -342,6 +636,8 @@ static void city__build_bridges(city_world& w, const city_catalog& cat, phys_wor
 
     const city_model* deck_model = city_get(cat, cat.singles[ONE_BRIDGE]);
     const city_model* pier_model = city_get(cat, cat.singles[ONE_PIER]);
+    const city_model* truss_model = city_get(cat, cat.singles[ONE_BRIDGE_ARCH]);
+    const city_model* rail_model = city_get(cat, cat.singles[ONE_WALL]);
 
     for (int z = 0; z < CITY_CELLS; z++)
         for (int x = 0; x < CITY_CELLS; x++) {
@@ -349,13 +645,131 @@ static void city__build_bridges(city_world& w, const city_catalog& cat, phys_wor
             city_cell& c = city_at(w, x, z);
             c.kind = CELL_ROAD;
             c.flags |= CELLF_BRIDGE;
+        }
 
+    // ---- the spans ----
+    //
+    // A crossing is dressed as a whole, not a cell at a time, because the one
+    // piece of real bridge geometry in the catalogue is a truss that carries
+    // its own deck and railings from bank to bank. Its proportions are what
+    // decide where it can go: it is 3.6 long to 1.1 wide, so scaled to span
+    // three cells it comes out 7.4 m across - within a few centimetres of the
+    // carriageway it has to cover. That is luck, but it is measurable luck,
+    // and it is why a truss is only put on runs of three cells or more.
+    //
+    // Shorter crossings, and every cell a truss does not reach, get a stone
+    // parapet instead. Either way the edge is closed: this is the one place
+    // in the city where walking off the side is a six metre drop into water.
+    static bool trussed[CITY_CELLS * CITY_CELLS];
+    memset(trussed, 0, sizeof(trussed));
+
+    if (truss_model) {
+        vec3 te = v3sub(truss_model->bounds_max, truss_model->bounds_min);
+        float unit = te.x > 1e-3f ? te.x : 1.0f;          // its length in model units
+
+        for (int axis = 0; axis < 2; axis++) {
+            int dx = axis ? 0 : 1, dz = axis ? 1 : 0;
+            int span_dir = axis ? DIR_PZ : DIR_PX;
+            for (int z = 0; z < CITY_CELLS; z++)
+                for (int x = 0; x < CITY_CELLS; x++) {
+                    size_t at = (size_t)z * CITY_CELLS + x;
+                    if (!deck[at]) continue;
+                    // only the first cell of a run, and only a run that lies
+                    // along this axis rather than across it
+                    int px = x - dx, pz = z - dz;
+                    if (city_in_bounds(px, pz) && deck[(size_t)pz * CITY_CELLS + px]) continue;
+                    int n = 0;
+                    while (city_in_bounds(x + dx * n, z + dz * n)
+                           && deck[(size_t)(z + dz * n) * CITY_CELLS + (x + dx * n)]) n++;
+                    if (n < 3) continue;
+
+                    // Split a long crossing into equal spans of three or four
+                    // cells rather than stretching one truss the whole way -
+                    // a hundred metre truss scaled from a footbridge is thirty
+                    // metres tall and reads as a gantry over the road.
+                    int spans = (n + 3) / 4;
+                    int base = n / spans, extra = n % spans;
+                    int start = 0;
+                    for (int s2 = 0; s2 < spans; s2++) {
+                        int len = base + (s2 < extra ? 1 : 0);
+                        if (len < 3) { start += len; continue; }
+                        float metres = (float)len * CITY_TILE;
+                        vec3 a = cell_centre(x + dx * start, z + dz * start);
+                        vec3 b = cell_centre(x + dx * (start + len - 1), z + dz * (start + len - 1));
+                        vec3 mid = v3scale(v3add(a, b), 0.5f);
+                        float sc = metres / unit;
+                        float yaw = dir_to_yaw_along(span_dir);
+
+                        // Hung by its deck, not stood on its base.
+                        //
+                        // The model is a whole bridge - piers below, deck in
+                        // the middle, trusses above - so its lowest point is
+                        // the bottom of a pier, several metres under the water
+                        // it stands in. Placing that at road level lifts the
+                        // deck a full storey into the air and the road runs
+                        // out from under a flyover. The deck is the band the
+                        // vertices pile into, a shade over half way up (see
+                        // the height bands dump_assets prints), and that is
+                        // what has to land on the tarmac.
+                        //
+                        // The same goes sideways: this model is not centred on
+                        // its own origin, so the span is centred by its
+                        // measured middle rather than by where the exporter
+                        // happened to leave (0,0).
+                        vec3 c = v3scale(v3add(truss_model->bounds_min, truss_model->bounds_max), 0.5f);
+                        float deck_y = truss_model->bounds_min.y + te.y * 0.55f;
+                        vec3 at = v3sub(mid, city__rot_y(v3(c.x * sc, 0.0f, c.z * sc), yaw));
+                        at.y = ROAD_Y - deck_y * sc;
+                        city__prop(w, truss_model, at, yaw, sc, VIEW_DISTANCE);
+                        for (int k = 0; k < len; k++)
+                            trussed[(size_t)(z + dz * (start + k)) * CITY_CELLS
+                                    + (x + dx * (start + k))] = true;
+                        start += len;
+                    }
+                }
+        }
+    }
+
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t at = (size_t)z * CITY_CELLS + x;
+            if (!deck[at]) continue;
             vec3 p = cell_centre(x, z);
+
             // the deck fills the gap between the water and the road surface
             city__prop_mesh(w, deck_model ? deck_model->mesh : (idx)-1, cat.mat_concrete,
                             v3(p.x, WATER_LEVEL + 0.4f, p.z), 0.0f,
                             CITY_TILE, ROAD_Y - (WATER_LEVEL + 0.4f), CITY_TILE, VIEW_DISTANCE);
-            if (pier_model && ((x + z) & 1) == 0)
+
+            // Which axis the span runs along. Both ends of a deck cell are
+            // road by construction, so this is only ambiguous on the
+            // single-cell causeway crossings, where either answer is right.
+            bool along_x = city_is_road(w, x - 1, z) && city_is_road(w, x + 1, z);
+            int span_dir = along_x ? DIR_PX : DIR_PZ;
+            int side_dir = along_x ? DIR_PZ : DIR_PX;
+
+            // The parapet, where a truss is not already carrying a railing.
+            // The collider goes on either way - the truss is scenery and the
+            // edge has to be closed whether or not it is standing there.
+            for (int sgn = -1; sgn <= 1; sgn += 2) {
+                vec3 edge = v3add(v3(p.x, ROAD_Y, p.z),
+                                  v3scale(dir_to_vec(side_dir), sgn * CITY_TILE * 0.46f));
+                if (trussed[at]) {
+                    vec3 dir = dir_to_vec(span_dir);
+                    vec3 lo = v3(edge.x - fabsf(dir.x) * CITY_TILE * 0.5f - fabsf(dir.z) * 0.25f,
+                                 edge.y,
+                                 edge.z - fabsf(dir.z) * CITY_TILE * 0.5f - fabsf(dir.x) * 0.25f);
+                    vec3 hi = v3(edge.x + fabsf(dir.x) * CITY_TILE * 0.5f + fabsf(dir.z) * 0.25f,
+                                 edge.y + 1.2f,
+                                 edge.z + fabsf(dir.z) * CITY_TILE * 0.5f + fabsf(dir.x) * 0.25f);
+                    phys_add_static_box(phys, lo, hi);
+                } else {
+                    city__run_barrier(w, phys, rail_model, edge, span_dir, 1.2f, PROP_FADE_MID);
+                }
+            }
+
+            // and a pier down to the bed under the untrussed spans
+            if (pier_model && !trussed[at] && ((x + z) & 1) == 0)
                 city__prop_mesh(w, pier_model->mesh, cat.mat_dirt,
                                 v3(p.x, RIVER_BED, p.z), 0.0f,
                                 CITY_TILE * 0.3f, WATER_LEVEL + 0.4f - RIVER_BED,
@@ -364,25 +778,38 @@ static void city__build_bridges(city_world& w, const city_catalog& cat, phys_wor
 }
 
 // ---- pass 1: streets ----
+//
+// Every island gets a road round its coast and then one of two interior
+// plans. The plans are what make two districts feel unalike from the ground:
+// a grid reads as a downtown even when its buildings are short, and a set of
+// curving lanes reads as a suburb even when its houses are tall.
+
+// Cells of land left between the coast road and the water. Two is enough for
+// a promenade with trees on it and a railing at the edge, and it is what
+// stops a street ending in mid-air the moment the cleanup pass moves the
+// shoreline by one.
+#define COAST_INSET   3
+// Four, not five. A lot is only built on if it fronts a street, so the gap
+// between two rings is what decides whether the middle of a suburb is
+// houses or an empty field - and at five, three cells of every block were
+// too deep to build on and the islands came out hollow.
+#define LANE_SPACING  4    // cells between one ring road and the next, inland
 
 // Cuts a rectangle in two with a street and recurses, until every piece is a
 // block. Preferring the long axis keeps blocks roughly square; the cut position
 // is random within the range that leaves both halves legal, which is what makes
 // the grid irregular without ever producing a slice too thin to build on.
+//
+// Only the streets are drawn here. What a block *is* now comes from flooding
+// the finished grid (city__derive_blocks_from_grid), which is the one thing
+// that can describe a block on an island whose streets curve - and it means a
+// generated map and a hand-edited one go down exactly the same path.
 static void city__subdivide(city_world& w, rng& r, int x0, int z0, int x1, int z1, int depth) {
     int width = x1 - x0 + 1, height = z1 - z0 + 1;
     bool can_x = width  >= BLOCK_MIN * 2 + 1;
     bool can_z = height >= BLOCK_MIN * 2 + 1;
     bool must  = width > BLOCK_MAX || height > BLOCK_MAX;
-
-    if (!must || (!can_x && !can_z) || depth > 20) {
-        if (w.block_count < CITY_MAX_BLOCKS) {
-            city_block& b = w.blocks[w.block_count++];
-            b.x0 = x0; b.z0 = z0; b.x1 = x1; b.z1 = z1;
-            b.zone = ZONE_RESIDENTIAL;
-        }
-        return;
-    }
+    if (!must || (!can_x && !can_z) || depth > 20) return;
 
     bool split_x = can_x && (!can_z || width >= height);
     if (split_x) {
@@ -400,34 +827,276 @@ static void city__subdivide(city_world& w, rng& r, int x0, int z0, int x1, int z
     }
 }
 
-static void city__zone_blocks(city_world& w, rng& r) {
-    float centre = CITY_CELLS * 0.5f;
-    for (size_t i = 0; i < w.block_count; i++) {
-        city_block& b = w.blocks[i];
-        float cx = (b.x0 + b.x1) * 0.5f - centre;
-        float cz = (b.z0 + b.z1) * 0.5f - centre;
-        float dist = sqrtf(cx * cx + cz * cz) / centre;   // 0 at the middle, ~1 at the edge
+// A road wherever the land is exactly `inset` cells from the sea. Because the
+// shore distance is measured from the actual coastline, the result is a closed
+// loop that follows every headland and bay - a curved road built out of a
+// square grid, with no spline anywhere in it.
+static void city__lay_shore_ring(city_world& w, int island, int inset) {
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t i = (size_t)z * CITY_CELLS + x;
+            if (w.cells[i].kind == CELL_WATER || w.shore[i] != inset) continue;
+            if (city__island_at(w, x, z) != island) continue;
+            w.cells[i].kind = CELL_ROAD;
+        }
+}
 
-        if      (dist < 0.15f) b.zone = ZONE_DOWNTOWN;
-        else if (dist < 0.34f) b.zone = ZONE_COMMERCIAL;
-        else if (dist < 0.58f) b.zone = ZONE_RESIDENTIAL;
-        else                   b.zone = ZONE_SUBURB;
-
-        // Parks and industry are placed against the gradient rather than at
-        // random: greenery is what the residential ring wants, and industry
-        // belongs out where the land is cheap.
-        float roll = rng_float(r);
-        if (dist > 0.18f && roll < 0.11f)                    b.zone = ZONE_PARK;
-        else if (dist > 0.62f && roll > 0.11f && roll < 0.26f) b.zone = ZONE_INDUSTRIAL;
-
-        for (int z = b.z0; z <= b.z1; z++)
-            for (int x = b.x0; x <= b.x1; x++) {
-                city_cell& c = city_at(w, x, z);
-                if (c.kind == CELL_WATER) continue;   // the river predates the block
-                c.zone = b.zone;
-                if (c.kind != CELL_ROAD) c.kind = (b.zone == ZONE_PARK) ? CELL_PARK : CELL_LOT;
-            }
+// Straight out from the middle of an island to its coast. A ring road with no
+// spokes is a racetrack: everything inside it is unreachable, and what it
+// encloses is one solid lump the building pass can do nothing with.
+static void city__lay_spoke(city_world& w, const city_island& is, float angle) {
+    for (float t = 0.0f; t < is.radius * 1.4f; t += 0.5f) {
+        int x = (int)(is.cx + cosf(angle) * t);
+        int z = (int)(is.cz + sinf(angle) * t);
+        if (!city_in_bounds(x, z)) return;
+        if (city_at(w, x, z).kind == CELL_WATER) return;   // stop at the water's edge
+        city_at(w, x, z).kind = CELL_ROAD;
     }
+}
+
+static void city__lay_island_streets(city_world& w, rng& r, int island) {
+    const city_island& is = w.islands[island];
+    if (is.radius < 5.0f) return;              // an islet is scenery, not a district
+
+    city__lay_shore_ring(w, island, COAST_INSET);
+#ifdef CITY_MAP_VERBOSE
+    { int ring = 0;
+      for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++)
+          if (w.cells[i].kind == CELL_ROAD) ring++;
+      printf("  island %d: coast ring laid, %d road cells on the map so far\n", island, ring); }
+#endif
+
+    if (is.plan == ISLAND_GRID) {
+        int x0 = (int)(is.cx - is.radius * 1.3f), x1 = (int)(is.cx + is.radius * 1.3f);
+        int z0 = (int)(is.cz - is.radius * 1.3f), z1 = (int)(is.cz + is.radius * 1.3f);
+        if (x0 < 1) x0 = 1;
+        if (z0 < 1) z0 = 1;
+        if (x1 > CITY_CELLS - 2) x1 = CITY_CELLS - 2;
+        if (z1 > CITY_CELLS - 2) z1 = CITY_CELLS - 2;
+#ifdef CITY_MAP_VERBOSE
+        printf("  island %d: grid over x %d..%d  z %d..%d\n", island, x0, x1, z0, z1);
+#endif
+        city__subdivide(w, r, x0, z0, x1, z1, 0);
+        return;
+    }
+
+    // Lanes: more rings the further inland it gets, joined by a handful of
+    // spokes. Every ring inherits the coastline's own shape, so each is a
+    // different curve rather than a scaled copy of the one outside it.
+    for (int inset = COAST_INSET + LANE_SPACING; inset < 40; inset += LANE_SPACING)
+        city__lay_shore_ring(w, island, inset);
+
+    int spokes = 4 + (int)(is.radius / 4.0f);
+    float base = rng_range(r, 0.0f, 6.2831853f);
+    for (int i = 0; i < spokes; i++)
+        city__lay_spoke(w, is, base + 6.2831853f * (float)i / (float)spokes
+                                   + rng_range(r, -0.25f, 0.25f));
+}
+
+// ---- pass 1b: making the network one network ----
+//
+// Every street plan above is laid island by island, in ignorance of the rest
+// of the map, so what comes out of it is a dozen separate road networks. This
+// is the pass that makes them one, and it is the pass the whole archipelago
+// stands on: a district the traffic cannot drive to is a district the player
+// cannot drive to either, and the streets on it get thrown away as
+// unreachable.
+//
+// It works on *road components* rather than on islands, which matters more
+// than it sounds. Two islands can easily end up joined by land and still have
+// no road between them - the coast roads of each simply never meet - and an
+// island-to-island bridge pass cannot see that at all, because there is no
+// water in between to bridge. Asking "is every road reachable from every
+// other road" is the question that actually needed answering.
+//
+// The connection itself is a breadth-first walk out from the main network
+// over every cell, land or water: the shortest path back is then found by
+// walking downhill through that distance field. Over land it comes out as a
+// street, over water as a causeway - and because it is a genuine shortest
+// path, it lands where a bridge would sensibly be built rather than wherever
+// a straight line between two island centres happened to cross.
+
+// Road runs smaller than this are stubs - a spoke that never reached a ring,
+// two cells clipped off by a bay - and are dropped rather than connected.
+#define ROAD_KEEP_MIN 12
+// How many separate networks are worth stitching in before giving up. Ten
+// islands cannot need more than this, and it stops a pathological map from
+// spending the whole load doing it.
+#define ROAD_LINK_TRIES 16
+
+// Labels every road cell with the index of the network it belongs to.
+// Returns the number of networks; `out_size` gets each one's cell count.
+static int city__label_roads(const city_world& w, int32_t* label, int* out_size, int max_labels) {
+    static int stack[CITY_CELLS * CITY_CELLS];
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++) label[i] = -1;
+
+    int labels = 0;
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t start = (size_t)z * CITY_CELLS + x;
+            if (w.cells[start].kind != CELL_ROAD || label[start] >= 0) continue;
+            if (labels >= max_labels) return labels;
+
+            int me = labels++, size = 0, sp = 0;
+            label[start] = me;
+            stack[sp++] = (int)start;
+            while (sp > 0) {
+                int cell = stack[--sp];
+                size++;
+                int cx = cell % CITY_CELLS, cz = cell / CITY_CELLS;
+                for (int d = 0; d < 4; d++) {
+                    int nx = cx + DIR_DX[d], nz = cz + DIR_DZ[d];
+                    if (!city_in_bounds(nx, nz)) continue;
+                    size_t ni = (size_t)nz * CITY_CELLS + nx;
+                    if (label[ni] >= 0 || w.cells[ni].kind != CELL_ROAD) continue;
+                    label[ni] = me;
+                    stack[sp++] = (int)ni;
+                }
+            }
+            out_size[me] = size;
+        }
+    return labels;
+}
+
+// Breadth-first distance, in cells, from every cell of network `from` to
+// everywhere else on the map - through water as readily as over land, because
+// a causeway is exactly as valid a connection as a street.
+static void city__flood_from_network(const city_world& w, const int32_t* label, int from,
+                                     uint16_t* dist) {
+    static int queue[CITY_CELLS * CITY_CELLS];
+    int head = 0, tail = 0;
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++) dist[i] = 0xFFFF;
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++)
+        if (label[i] == from) { dist[i] = 0; queue[tail++] = (int)i; }
+
+    while (head < tail) {
+        int cell = queue[head++];
+        int cx = cell % CITY_CELLS, cz = cell / CITY_CELLS;
+        uint16_t next = (uint16_t)(dist[cell] + 1);
+        for (int d = 0; d < 4; d++) {
+            int nx = cx + DIR_DX[d], nz = cz + DIR_DZ[d];
+            // never route along the outermost ring: the sea has to stay open
+            if (nx < 1 || nz < 1 || nx >= CITY_CELLS - 1 || nz >= CITY_CELLS - 1) continue;
+            size_t ni = (size_t)nz * CITY_CELLS + nx;
+            if (dist[ni] <= next) continue;
+            dist[ni] = next;
+            queue[tail++] = (int)ni;
+        }
+    }
+}
+
+// Walks from `cell` back to the network the distance field came from, turning
+// what it crosses into road. Water becomes a flagged bridge cell, which
+// city__build_bridges later gives a deck and piers.
+static void city__carve_link(city_world& w, const uint16_t* dist, int cell) {
+    for (int guard = 0; guard < CITY_CELLS * 4; guard++) {
+        int cx = cell % CITY_CELLS, cz = cell / CITY_CELLS;
+        city_cell& c = w.cells[cell];
+        if (c.kind == CELL_WATER) {
+            c.kind = CELL_ROAD;
+            c.flags |= CELLF_BRIDGE;
+        } else {
+            c.kind = CELL_ROAD;
+        }
+        if (dist[cell] == 0) return;          // arrived
+
+        int best = -1;
+        uint16_t best_d = dist[cell];
+        for (int d = 0; d < 4; d++) {
+            int nx = cx + DIR_DX[d], nz = cz + DIR_DZ[d];
+            if (!city_in_bounds(nx, nz)) continue;
+            size_t ni = (size_t)nz * CITY_CELLS + nx;
+            if (dist[ni] < best_d) { best_d = dist[ni]; best = (int)ni; }
+        }
+        if (best < 0) return;                 // no downhill neighbour: give up cleanly
+        cell = best;
+    }
+}
+
+static void city__connect_roads(city_world& w) {
+    static int32_t  label[CITY_CELLS * CITY_CELLS];
+    static uint16_t dist[CITY_CELLS * CITY_CELLS];
+    static int size[CITY_CELLS * CITY_CELLS / 4];
+
+    for (int attempt = 0; attempt < ROAD_LINK_TRIES; attempt++) {
+        int labels = city__label_roads(w, label, size, CITY_CELLS * CITY_CELLS / 4);
+        if (labels <= 1) return;
+
+        int main_label = 0;
+        for (int i = 1; i < labels; i++) if (size[i] > size[main_label]) main_label = i;
+
+        // the biggest network that is not the main one, and worth keeping
+        int join = -1;
+        for (int i = 0; i < labels; i++) {
+            if (i == main_label || size[i] < ROAD_KEEP_MIN) continue;
+            if (join < 0 || size[i] > size[join]) join = i;
+        }
+        if (join < 0) return;                 // nothing left but stubs
+
+        city__flood_from_network(w, label, main_label, dist);
+
+        // the cell of `join` that is closest to the main network is where the
+        // link wants to start - that is the natural landing point for a bridge
+        int from = -1;
+        uint16_t best = 0xFFFF;
+        for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++)
+            if (label[i] == join && dist[i] < best) { best = dist[i]; from = (int)i; }
+        if (from < 0) return;
+        city__carve_link(w, dist, from);
+    }
+}
+
+// Whatever is left over after the linking pass - stubs too small to be worth
+// a bridge - goes back to being land. A road nothing can drive to is worse
+// than no road: the traffic spawns onto it and spends the rest of its life
+// shunting back and forth on a two-cell island.
+static void city__prune_roads(city_world& w) {
+    static int32_t label[CITY_CELLS * CITY_CELLS];
+    static int size[CITY_CELLS * CITY_CELLS / 4];
+    int labels = city__label_roads(w, label, size, CITY_CELLS * CITY_CELLS / 4);
+    if (labels <= 1) return;
+
+    int main_label = 0;
+    for (int i = 1; i < labels; i++) if (size[i] > size[main_label]) main_label = i;
+
+    for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++)
+        if (w.cells[i].kind == CELL_ROAD && label[i] != main_label) {
+            // a stranded bridge cell has nothing under it: give the sea back
+            w.cells[i].kind = (w.cells[i].flags & CELLF_BRIDGE) ? CELL_WATER : CELL_GROUND;
+            w.cells[i].flags &= (uint8_t)~CELLF_BRIDGE;
+        }
+}
+
+// ---- pass 1c: zoning ----
+//
+// Zone comes off the island a cell sits on rather than off its distance from
+// the middle of the map: an island *is* a district, which is the whole reason
+// for building the city this way.
+static void city__zone_islands(city_world& w, rng& r) {
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            city_cell& c = city_at(w, x, z);
+            if (c.kind == CELL_WATER) continue;
+
+            int island = city__island_at(w, x, z);
+            const city_island& is = w.islands[island < 0 ? 0 : island];
+            float dx = (float)x + 0.5f - is.cx, dz = (float)z + 0.5f - is.cz;
+            float d = sqrtf(dx * dx + dz * dz) / (is.radius > 1.0f ? is.radius : 1.0f);
+
+            uint8_t zone = (d < 0.55f) ? is.core_zone : is.edge_zone;
+
+            // A strip of green all the way round every island. It is what the
+            // reference maps all have and what makes a coast read as a coast:
+            // the buildings stop, there is a park and a promenade, and then
+            // the water - rather than a tower standing in the sea.
+            size_t i = (size_t)z * CITY_CELLS + x;
+            if (w.shore[i] > 0 && w.shore[i] < COAST_INSET) zone = ZONE_PARK;
+            else if (d > 0.25f && rng_chance(r, 0.05f))     zone = ZONE_PARK;
+
+            c.zone = zone;
+            if (c.kind != CELL_ROAD)
+                c.kind = (zone == ZONE_PARK) ? CELL_PARK : CELL_LOT;
+        }
 }
 
 // ---- pass 2: sidewalks, frontage, junctions ----
@@ -654,9 +1323,35 @@ static void city__place_buildings(city_world& w, const city_catalog& cat, phys_w
                 float lot_density = density * (c.depth == 0 ? 1.0f : 0.62f);
                 if (!rng_chance(r, lot_density)) continue;   // a gap: yard, scrub, empty lot
 
-                // most of the block in its own colour, the odd infill in another
-                int facade = rng_chance(r, 0.82f) ? block_facade : city__pick_facade(b.zone, r);
-                const city_model* m = city_building(cat, facade, city__pick_building_kind(b.zone, r));
+                // A suburb is detached houses, not shopfronts. The downtown
+                // kit is one model per *block face*, modelled to fill a whole
+                // tile and butt up against its neighbour, so a street of them
+                // is a terrace however far apart they are put - which is
+                // exactly wrong for a suburb, and was what every outer
+                // district in the city used to be built out of. Kenney's
+                // suburban kit is a house per lot with a roof and a garden
+                // round it, and it only ever appears out here.
+                const city_model* m = 0;
+                bool detached = (b.zone == ZONE_SUBURB
+                                 || (b.zone == ZONE_RESIDENTIAL && rng_chance(r, 0.45f)))
+                              && cat.sets[SET_HOUSE].count > 0;
+                // Whole buildings where the street is built up, and the
+                // KayKit block faces as the infill between them rather than
+                // as the entire city. Eight shapes in five colours is enough
+                // variety to fill a block and nothing like enough to fill a
+                // city: past about two blocks the eye starts matching
+                // silhouettes, and from then on every street is the same
+                // street in a different colour.
+                bool whole = !detached && cat.sets[SET_TOWER].count > 0
+                             && rng_chance(r, b.zone == ZONE_DOWNTOWN ? 0.55f : 0.70f);
+                if (detached)    m = city_pick(cat, SET_HOUSE, rng_u32(r));
+                else if (whole)  m = city_pick(cat, SET_TOWER, rng_u32(r));
+                else {
+                    // most of the block in its own colour, the odd infill in another
+                    int facade = rng_chance(r, 0.82f) ? block_facade
+                                                      : city__pick_facade(b.zone, r);
+                    m = city_building(cat, facade, city__pick_building_kind(b.zone, r));
+                }
                 if (!m) continue;
                 c.flags |= CELLF_OCCUPIED;
 
@@ -664,18 +1359,288 @@ static void city__place_buildings(city_world& w, const city_catalog& cat, phys_w
                 // on the building line rather than a whole tile behind it. Every
                 // row of the block moves by the same amount, so the rows stay
                 // shoulder to shoulder and only the courtyard behind them grows.
-                vec3 pos = v3add(cell_centre(x, z),
-                                 v3scale(dir_to_vec(c.facing), LOT_LINE_SHIFT));
-                float yaw = dir_to_yaw_building(c.facing);
-                // a few percent of natural variance, not a fake extra storey
-                float sy = rng_range(r, 0.94f, 1.10f);
+                // A terrace is pushed streetward until its facade lands on the
+                // building line; a detached house stands back from it with a
+                // garden in front, which is most of what a suburb looks like.
+                float shift = detached ? LOT_LINE_SHIFT * 0.35f : LOT_LINE_SHIFT;
+                vec3 pos = v3add(cell_centre(x, z), v3scale(dir_to_vec(c.facing), shift));
+                // Which way round the model itself was authored is the model
+                // own business - see city_model::yaw_offset. Every kit in the
+                // catalogue disagrees with at least one other about where a
+                // facade goes, and a rule per kit here is how a suburb ends up
+                // presenting its back doors to the street.
+                float yaw = dir_to_yaw(c.facing) + m->yaw_offset;
+                // A few percent of natural variance on a tileable block face,
+                // and none at all on a whole building: stretching a model
+                // that has a roof on it is immediately visible as a stretched
+                // roof, which the block faces do not have to worry about.
+                float sy = (detached || whole) ? 1.0f : rng_range(r, 0.94f, 1.10f);
 
-                city__prop(w, m, pos, yaw, m->scale, VIEW_DISTANCE, (idx)-1, m->scale * sy);
+                // Widened across the facade, and only there.
+                //
+                // These models are lot-fitted by their longest plan axis, so a
+                // shallow one ends up narrower than its lot and a terrace of
+                // them shows a stripe of pavement between every pair. Pushing
+                // the frontage out past the cell closes those gaps into one
+                // continuous street wall - the neighbours interpenetrate by a
+                // few centimetres of side wall, which is invisible, where the
+                // gap was not. Depth is left alone: that grows into the block
+                // interior, which is somebody else's courtyard.
+                float sx = whole ? m->scale * 1.15f : m->scale;
+
+                city__prop(w, m, pos, yaw, m->scale, VIEW_DISTANCE, (idx)-1,
+                           m->scale * sy, sx);
 
                 vec3 ext = v3sub(m->bounds_max, m->bounds_min);
-                phys_add_static_prop(phys, pos, yaw,
-                                     v2(ext.x * 0.5f * m->scale, ext.z * 0.5f * m->scale),
-                                     ext.y * m->scale * sy);
+                city__collide_model(phys, m, pos, yaw, m->scale, m->scale * sy, 1.0f, sx);
+
+                // A residential or suburb building gets a front door - see
+                // city_house.hpp. A fixed offset from `pos` put this marker
+                // inside the building itself and made the door unreachable:
+                // `pos` is the model's *centre*, and these buildings run
+                // several metres deep, well past any small fixed step. The
+                // static collider just above already measured the model's
+                // real half-depth for exactly this reason - reuse it, and
+                // step out past the wall face by a stride's clearance rather
+                // than guessing a distance that happens to clear it.
+                //
+                // aabb_from_obb rotates that box by `yaw`: at the axis-aligned
+                // yaws every building uses, local depth (bounds_max.z -
+                // bounds_min.z) lands on world Z when facing north or south,
+                // and on world X when facing east or west, so which of ext.x
+                // / ext.z is "toward the street" swaps with facing too.
+                if ((b.zone == ZONE_RESIDENTIAL || b.zone == ZONE_SUBURB)
+                    && w.house_count < CITY_MAX_HOUSES) {
+                    float half_depth = (c.facing == DIR_PX || c.facing == DIR_NX)
+                        ? ext.x * 0.5f * m->scale
+                        : ext.z * 0.5f * m->scale;
+                    city_house& h = w.houses[w.house_count++];
+                    h.door_pos = v3add(pos, v3scale(dir_to_vec(c.facing), half_depth + 1.3f));
+                    h.door_pos.y = 0.0f;
+                    h.exit_yaw = yaw_from_forward(dir_to_vec(c.facing));
+                    // stable across regenerations of the same seed, and
+                    // independent of the order houses happen to be visited in
+                    h.id = hash2(x, z, w.seed ^ 0xE17E10u);
+                }
+            }
+    }
+}
+
+// ---- pass 3a: landmarks ----
+//
+// One building per district that is not like the others. A city is navigated
+// by them - "past the church", "by the radio mast" - and a grid of blocks
+// where every block is interchangeable is the thing that makes a generated
+// city feel like a generated city however good the individual buildings are.
+//
+// Deliberately rare, and never twice in the same block: a landmark repeated
+// down a street stops being one.
+static void city__place_landmarks(city_world& w, const city_catalog& cat, phys_world& phys) {
+    if (!cat.sets[SET_LANDMARK].count) return;
+    idx first = cat.sets[SET_LANDMARK].first;
+    int  n = (int)cat.sets[SET_LANDMARK].count;
+
+    for (size_t bi = 0; bi < w.block_count; bi++) {
+        const city_block& b = w.blocks[bi];
+        if (b.zone == ZONE_PARK) continue;
+        rng r = rng_at(b.x0, b.z0, 0x1A2D3Au);
+        if (!rng_chance(r, 0.18f)) continue;
+
+        // Which landmark suits which district. The set is loaded in a known
+        // order (church, two masts, a statue, two barns) and picked from by
+        // index rather than by name, so a file that fails to load shortens
+        // the set and the modulo keeps every choice in range instead of
+        // reaching past the end of it.
+        int want;
+        switch (b.zone) {
+            case ZONE_INDUSTRIAL: want = 1; break;                       // radio mast
+            case ZONE_DOWNTOWN:
+            case ZONE_COMMERCIAL: want = rng_chance(r, 0.5f) ? 2 : 3; break;
+            case ZONE_SUBURB:     want = rng_chance(r, 0.5f) ? 4 : 5; break;  // barns
+            default:              want = 0; break;                       // the church
+        }
+        const city_model* m = city_get(cat, first + (idx)(want % n));
+        if (!m) continue;
+
+        // The first street-facing lot in the block that has the room for it.
+        // A landmark is one to two cells deep, so the cell behind it has to
+        // be free as well - and both are marked, or the building pass drops a
+        // terrace through the back of the church.
+        bool placed = false;
+        for (int z = b.z0; z <= b.z1 && !placed; z++)
+            for (int x = b.x0; x <= b.x1 && !placed; x++) {
+                city_cell& c = city_at(w, x, z);
+                if (c.kind != CELL_LOT || c.facing == DIR_NONE) continue;
+                if (c.flags & CELLF_OCCUPIED) continue;
+                if (c.depth != 0) continue;
+
+                int back = (c.facing + 2) & 3;
+                int bx = x + DIR_DX[back], bz = z + DIR_DZ[back];
+                if (!city_in_bounds(bx, bz)) continue;
+                city_cell& behind = city_at(w, bx, bz);
+                if (behind.kind != CELL_LOT || (behind.flags & CELLF_OCCUPIED)) continue;
+
+                c.flags |= CELLF_OCCUPIED;
+                behind.flags |= CELLF_OCCUPIED;
+
+                // Stood on the boundary between the two cells it occupies, so
+                // a deep model is centred on the ground it was given rather
+                // than hanging half of itself over the pavement.
+                vec3 pos = v3add(cell_centre(x, z),
+                                 v3scale(dir_to_vec(back), CITY_TILE * 0.5f - 1.0f));
+                float yaw = dir_to_yaw(c.facing) + m->yaw_offset;
+                city__prop(w, m, pos, yaw, m->scale, VIEW_DISTANCE);
+                city__collide_model(phys, m, pos, yaw, m->scale);
+                placed = true;
+            }
+    }
+}
+
+// ---- pass 3b: parks that are places rather than edges ----
+//
+// Every island already gets a ribbon of green round its coast, and that is
+// what makes a shoreline read as a shoreline - but it is scenery, not a park.
+// A park is somewhere with a boundary, a way in, paths across it and something
+// to do in the middle, and none of that can be decided a cell at a time: it is
+// a property of a whole block.
+//
+// So a handful of blocks are taken out of the building stock entirely and
+// given over to one. Which ones is a hash of the block corner, so the same
+// seed lays out the same parks however many times the city is rebuilt.
+static void city__make_parks(city_world& w) {
+    for (size_t bi = 0; bi < w.block_count; bi++) {
+        city_block& b = w.blocks[bi];
+        // A park has to be big enough to walk into. Anything smaller than
+        // three cells square is a verge, and a railing round one of those
+        // encloses a patch of grass with no room for a path.
+        if (b.x1 - b.x0 < 2 || b.z1 - b.z0 < 2) continue;
+        // Downtown land is the one place a whole-block park is wrong: a hole
+        // in the middle of a business district reads as a lot nobody built on.
+        if (b.zone == ZONE_DOWNTOWN) continue;
+
+        rng r = rng_at(b.x0, b.z0, 0x9A2B41u);
+        if (!rng_chance(r, 0.16f)) continue;
+
+        b.zone = ZONE_PARK;
+        for (int z = b.z0; z <= b.z1; z++)
+            for (int x = b.x0; x <= b.x1; x++) {
+                city_cell& c = city_at(w, x, z);
+                if (c.kind != CELL_LOT) continue;
+                c.kind = CELL_PARK;
+                c.zone = ZONE_PARK;
+                c.flags |= CELLF_PARKBLOCK;
+            }
+    }
+}
+
+// What goes in one. Runs before the scatter pass that fills a park cell with
+// trees and marks everything it uses CELLF_FEATURE, which is how a swing set
+// avoids having a maple growing through it.
+static void city__plan_parks(city_world& w, const city_catalog& cat, phys_world& phys) {
+    // The tall railing rather than the low stone wall, when both loaded: a
+    // park is fenced at chest height and a garden is walled at knee height.
+    const city_model* rail = 0;
+    if (cat.sets[SET_WALL].count > 1)  rail = city_get(cat, cat.sets[SET_WALL].first + 1);
+    else if (cat.sets[SET_WALL].count) rail = city_get(cat, cat.sets[SET_WALL].first);
+    const city_model* bench = city_get(cat, cat.singles[ONE_PARK_BENCH]);
+    const city_model* paving = city_get(cat, cat.singles[ONE_PATH]);
+
+    for (size_t bi = 0; bi < w.block_count; bi++) {
+        const city_block& b = w.blocks[bi];
+        if (b.zone != ZONE_PARK) continue;
+        int mx = (b.x0 + b.x1) / 2, mz = (b.z0 + b.z1) / 2;
+        rng r = rng_at(b.x0, b.z0, 0x7C0FFEu);
+
+        // ---- the paths: one across the park each way, through the middle,
+        // which is also where the railing is left open for a way in ----
+        for (int z = b.z0; z <= b.z1; z++)
+            for (int x = b.x0; x <= b.x1; x++) {
+                city_cell& c = city_at(w, x, z);
+                if (c.kind != CELL_PARK) continue;
+                if (x != mx && z != mz) continue;
+                c.flags |= CELLF_FEATURE;
+                if (!paving) continue;
+                // A path is laid end to end along its own length, which for
+                // every piece in this pack is its local Z - so the yaw that
+                // lines one up with the walk is dir_to_yaw, the same one a
+                // garden path already uses, and not dir_to_yaw_along, which
+                // turns the piece broadside and lays a row of paving slabs
+                // across the park instead of a footpath down it.
+                //
+                // How many to a cell comes off the piece rather than being
+                // guessed: too few and grass shows through at every cell
+                // boundary, too many and they overlap and flicker.
+                bool run_x = (z == mz);
+                int run_dir = run_x ? DIR_PX : DIR_PZ;
+                vec3 pe = v3sub(paving->bounds_max, paving->bounds_min);
+                float step = pe.z * paving->scale;
+                int pieces = step > 0.2f ? (int)ceilf(CITY_TILE / step) : 2;
+                if (pieces < 1) pieces = 1;
+                for (int k = 0; k < pieces; k++) {
+                    float along = (((float)k + 0.5f) / (float)pieces - 0.5f) * CITY_TILE;
+                    vec3 q = cell_centre(x, z, 0.02f);
+                    if (run_x) q.x += along;
+                    else       q.z += along;
+                    city__prop(w, paving, q, dir_to_yaw(run_dir), paving->scale, PROP_FADE_MID);
+                }
+            }
+
+        // ---- the playground, where the two paths meet ----
+        if (cat.sets[SET_PLAYGROUND].count && city_at(w, mx, mz).kind == CELL_PARK) {
+            // Set off the crossing itself, on its four corners, so the paths
+            // still run through the middle the way they do in a real park.
+            int n = (int)cat.sets[SET_PLAYGROUND].count;
+            for (int i = 0; i < 4; i++) {
+                const city_model* m = city_get(cat, cat.sets[SET_PLAYGROUND].first + (idx)(i % n));
+                if (!m) continue;
+                vec3 q = v3add(cell_centre(mx, mz),
+                               v3((i & 1) ? 2.6f : -2.6f, 0.0f, (i & 2) ? 2.6f : -2.6f));
+                float yaw = rng_range(r, 0.0f, 6.28f);
+                city__prop(w, m, q, yaw, m->scale, PROP_FADE_MID);
+                city__collide_model(phys, m, q, yaw, m->scale, 0.0f, 0.8f);
+            }
+        }
+
+        // ---- benches, set back off the path and turned to look along it ----
+        if (bench)
+            for (int z = b.z0; z <= b.z1; z++)
+                for (int x = b.x0; x <= b.x1; x++) {
+                    const city_cell& c = city_at(w, x, z);
+                    if (c.kind != CELL_PARK || !(c.flags & CELLF_FEATURE)) continue;
+                    if (x == mx && z == mz) continue;              // the playground cell
+                    rng br = rng_at(x, z, 0xBE7C4u);
+                    if (!rng_chance(br, 0.45f)) continue;
+                    bool run_x = (z == mz);
+                    int face = run_x ? (rng_chance(br, 0.5f) ? DIR_PZ : DIR_NZ)
+                                     : (rng_chance(br, 0.5f) ? DIR_PX : DIR_NX);
+                    vec3 q = v3add(cell_centre(x, z),
+                                   v3scale(dir_to_vec(face), -CITY_TILE * 0.28f));
+                    float yaw = dir_to_yaw(face);
+                    city__prop(w, bench, q, yaw, bench->scale, PROP_FADE_MID);
+                    city__collide_model(phys, bench, q, yaw, bench->scale, 0.0f, 0.9f);
+                }
+
+        // ---- the railing round the outside ----
+        //
+        // Walked cell by cell along the park own edge, which is the only way
+        // to fence a block whose outline is not a rectangle: a park cell next
+        // to the water, or one the topology pass turned into pavement, is not
+        // park any more and the railing follows that.
+        if (!rail) continue;
+        for (int z = b.z0; z <= b.z1; z++)
+            for (int x = b.x0; x <= b.x1; x++) {
+                const city_cell& c = city_at(w, x, z);
+                if (c.kind != CELL_PARK || !(c.flags & CELLF_PARKBLOCK)) continue;
+                if (x == mx || z == mz) continue;              // the path lines are the gates
+                for (int d = 0; d < 4; d++) {
+                    int nx = x + DIR_DX[d], nz = z + DIR_DZ[d];
+                    if (!city_in_bounds(nx, nz)) continue;
+                    const city_cell& n = city_at(w, nx, nz);
+                    if ((n.kind == CELL_PARK) && (n.flags & CELLF_PARKBLOCK)) continue;
+                    if (n.kind == CELL_WATER) continue;        // the bank has its own wall
+                    vec3 edge = v3add(cell_centre(x, z), v3scale(dir_to_vec(d), CITY_TILE * 0.5f));
+                    city__run_barrier(w, phys, rail, edge, (d + 1) & 3, 1.4f, PROP_FADE_MID);
+                }
             }
     }
 }
@@ -707,9 +1672,13 @@ static void city__place_street_furniture(city_world& w, const city_catalog& cat,
             // never gets two lamps on top of each other.
             int along_axis = (kerb == DIR_PX || kerb == DIR_NX) ? z : x;
             bool junction_corner = false;
+            int  junction_dir = -1;          // which way the junction lies
             for (int d = 0; d < 4; d++) {
                 const city_cell& n = city_at(w, x + DIR_DX[d], z + DIR_DZ[d]);
-                if (n.kind == CELL_ROAD && (n.flags & CELLF_JUNCTION)) junction_corner = true;
+                if (n.kind == CELL_ROAD && (n.flags & CELLF_JUNCTION)) {
+                    junction_corner = true;
+                    if (d != kerb) junction_dir = d;    // along the kerb, not across it
+                }
             }
 
             // One thing per cell in the kerb strip: two would either intersect
@@ -719,30 +1688,64 @@ static void city__place_street_furniture(city_world& w, const city_catalog& cat,
 
             if (along_axis % 4 == 0 && !junction_corner) {
                 const city_model* lamp = city_get(cat, cat.singles[ONE_STREETLIGHT]);
-                city__prop(w, lamp, kerb_pos, dir_to_yaw_arm(kerb), KIT_PROP_SCALE, PROP_FADE_MID);
-                phys_add_static_prop(phys, kerb_pos, 0.0f, v2(0.16f, 0.16f), 3.6f);
-                // The lamp head is on an arm reaching out over the carriageway,
-                // so the light does not hang above the post - it hangs where the
-                // arm puts it, which is what makes a lit street read as lit
-                // rather than as a row of glowing sticks.
-                if (w.lamp_count < CITY_MAX_LAMPS)
-                    w.lamps[w.lamp_count++] =
-                        v3add(kerb_pos, v3(out.x * 1.1f, LAMP_HEIGHT, out.z * 1.1f));
+                if (lamp) {
+                    // Every one of these props carries the scale that makes it
+                    // its own real size (see city_gltf_item). Handing them
+                    // KIT_PROP_SCALE instead was right only for the KayKit kit
+                    // they used to be: it stood an 18 m lamp post and a
+                    // waist-high fire hydrant on every corner of the city.
+                    //
+                    // The post is modelled with its arm reaching out along +Z
+                    // and the whole city works in -Z, so the yaw that puts the
+                    // arm out over the carriageway is the *opposite* of the
+                    // kerb direction.
+                    float lamp_yaw = dir_to_yaw((kerb + 2) & 3);
+                    city__prop(w, lamp, kerb_pos, lamp_yaw, lamp->scale, PROP_FADE_MID);
+                    // just the post, not the arm hanging over the road
+                    phys_add_static_prop(phys, kerb_pos, 0.0f, v2(0.18f, 0.18f),
+                                         (lamp->bounds_max.y - lamp->bounds_min.y) * lamp->scale);
+
+                    // The light hangs where the arm puts it, not above the
+                    // post: a lamp lighting the pavement it stands on and not
+                    // the road beside it is what makes a lit street read as a
+                    // row of glowing sticks.
+                    float reach = (lamp->bounds_max.z - lamp->bounds_min.z) * lamp->scale * 0.62f;
+                    float head  = (lamp->bounds_max.y - lamp->bounds_min.y) * lamp->scale - 0.25f;
+                    if (w.lamp_count < CITY_MAX_LAMPS)
+                        w.lamps[w.lamp_count++] =
+                            v3add(kerb_pos, v3(out.x * reach, head, out.z * reach));
+                }
                 taken = true;
             }
 
-            // traffic signals face the traffic that has to stop for them
+            // Traffic signals face the traffic that has to stop for them, and
+            // stand on the corner rather than in the middle of the kerb run.
+            //
+            // That is where a real one is - at the stop line, where a driver
+            // arriving at the junction can see it - and it also takes the
+            // signal off the line every other piece of street furniture is on.
+            // Sharing that line was the problem: a signal one cell short of a
+            // lamp post is eight metres away from it, but from eye level down
+            // the footpath the two are exactly in front of one another and the
+            // head reads as bolted to the lamp.
             if (!taken && junction_corner && rng_chance(r, 0.55f)) {
                 const city_model* light = city_get(cat, cat.singles[ONE_TRAFFICLIGHT]);
-                city__prop(w, light, kerb_pos, dir_to_yaw((kerb + 2) & 3), KIT_PROP_SCALE, PROP_FADE_MID);
-                phys_add_static_prop(phys, kerb_pos, 0.0f, v2(0.22f, 0.22f), 2.8f);
+                vec3 at = kerb_pos;
+                if (junction_dir >= 0)
+                    at = v3add(at, v3scale(dir_to_vec(junction_dir), CITY_TILE * 0.33f));
+                if (light)
+                    city__prop(w, light, at, dir_to_yaw((kerb + 2) & 3),
+                               light->scale, PROP_FADE_MID);
+                phys_add_static_prop(phys, at, 0.0f, v2(0.22f, 0.22f), 2.8f);
                 taken = true;
             }
 
             // hydrants space themselves out along the kerb the same way
             if (!taken && !junction_corner && along_axis % 9 == 3) {
                 const city_model* hyd = city_get(cat, cat.singles[ONE_HYDRANT]);
-                city__prop(w, hyd, kerb_pos, rng_range(r, 0.0f, 6.28f), KIT_PROP_SCALE, PROP_FADE_NEAR);
+                if (hyd)
+                    city__prop(w, hyd, kerb_pos, rng_range(r, 0.0f, 6.28f),
+                               hyd->scale, PROP_FADE_NEAR);
                 taken = true;
             }
 
@@ -771,13 +1774,34 @@ static void city__place_street_furniture(city_world& w, const city_catalog& cat,
             if (!taken && (behind.flags & CELLF_OCCUPIED)) {
                 if (rng_chance(r, 0.20f)) {
                     const city_model* bin = city_get(cat, cat.singles[ONE_BIN]);
-                    city__prop(w, bin, kerb_pos, rng_range(r, 0.0f, 6.28f),
-                               KIT_PROP_SCALE, PROP_FADE_NEAR);
+                    if (bin)
+                        city__prop(w, bin, kerb_pos, rng_range(r, 0.0f, 6.28f),
+                                   bin->scale, PROP_FADE_NEAR);
+                    taken = true;
                 } else if (rng_chance(r, 0.12f)) {
                     const city_model* bench = city_get(cat, cat.singles[ONE_BENCH]);
                     // seat turned to look out over the street
-                    city__prop(w, bench, kerb_pos, dir_to_yaw(kerb), KIT_PROP_SCALE, PROP_FADE_MID);
-                    phys_add_static_prop(phys, kerb_pos, dir_to_yaw(kerb), v2(0.8f, 0.3f), 0.9f);
+                    if (bench) {
+                        city__prop(w, bench, kerb_pos, dir_to_yaw(kerb), bench->scale, PROP_FADE_MID);
+                        city__collide_model(phys, bench, kerb_pos, dir_to_yaw(kerb),
+                                            bench->scale, 0.0f, 0.9f);
+                    }
+                    taken = true;
+                }
+            }
+
+            // Whatever else the street pack has: signs, cones, barriers,
+            // crates, a mailbox. Rare per cell on purpose - it is the one in
+            // twenty kerb cells with something unexpected on it that makes a
+            // street look used, and the one in three that makes it look like
+            // a props warehouse.
+            if (!taken && cat.street_clutter.count && rng_chance(r, 0.06f)) {
+                const city_model* extra = city_get(cat, cat.street_clutter.first
+                                                       + rng_u32(r) % cat.street_clutter.count);
+                if (extra) {
+                    float yaw = dir_to_yaw(kerb) + rng_range(r, -0.35f, 0.35f);
+                    city__prop(w, extra, kerb_pos, yaw, extra->scale, PROP_FADE_NEAR);
+                    city__collide_model(phys, extra, kerb_pos, yaw, extra->scale, 0.0f, 0.85f);
                 }
             }
         }
@@ -828,8 +1852,11 @@ static void city__dress_park(city_world& w, const city_catalog& cat, phys_world&
     }
     if (rng_chance(r, 0.045f)) {
         const city_model* f = city_pick(cat, SET_PARK_FEATURE, rng_u32(r));
-        city__prop(w, f, centre, rng_range(r, 0.0f, 6.28f), f ? f->scale : 1.0f, PROP_FADE_MID);
-        phys_add_static_prop(phys, centre, 0.0f, v2(0.8f, 0.8f), 2.0f);
+        float yaw = rng_range(r, 0.0f, 6.28f);
+        city__prop(w, f, centre, yaw, f ? f->scale : 1.0f, PROP_FADE_MID);
+        // off the model rather than a fixed 1.6 m square: this set runs from a
+        // 4 m obelisk to a lily pad, and one box fits neither
+        city__collide_model(phys, f, centre, yaw, f ? f->scale : 1.0f);
     }
 }
 
@@ -844,23 +1871,42 @@ static void city__dress_frontage(city_world& w, const city_catalog& cat, phys_wo
     bool paved_run = rng_chance(r, 0.5f);
     const city_model* paving = city_get(cat, cat.singles[paved_run ? ONE_DRIVEWAY : ONE_PATH]);
     if (paving) {
-        for (int step = 0; step < 3; step++) {
-            float along = LOT_LINE_SHIFT + CITY_TILE * (0.2f - 0.32f * (float)step);
+        // Stepped by the piece own length, so the run is continuous whatever
+        // that length is. A fixed step is either a dashed line of slabs or a
+        // stack of them overlapping in one plane, and which of the two it is
+        // depends on a model size the generator never looked at.
+        vec3 pe = v3sub(paving->bounds_max, paving->bounds_min);
+        float len = pe.z * paving->scale;
+        if (len < 0.2f) len = 1.0f;
+        int steps = (int)ceilf((LOT_LINE_SHIFT + CITY_TILE * 0.45f) / len);
+        if (steps > 8) steps = 8;
+        for (int step = 0; step < steps; step++) {
+            float along = LOT_LINE_SHIFT + CITY_TILE * 0.2f - len * (float)step;
             vec3 q = v3add(base, v3scale(dir_to_vec(f), along));
             city__prop(w, paving, q, dir_to_yaw(f), paving->scale, PROP_FADE_MID);
         }
     }
 
-    // fence along the two lot boundaries that run to the street
+    // The boundary between this garden and the next, along the two lot
+    // edges that run to the street. Half the houses on a street have a fence
+    // and half have a low wall, and which one is a property of the house
+    // rather than of the edge - so it is rolled once here and both sides of
+    // the same garden get the same thing, which is what a real boundary does.
     const city_model* fence = city_get(cat, cat.singles[ONE_FENCE]);
-    if (fence) {
+    const city_model* wall  = city_get(cat, cat.singles[ONE_WALL]);
+    bool walled = wall && rng_chance(r, 0.4f);
+    {
         int side = (f + 1) & 3;
         for (int sgn = -1; sgn <= 1; sgn += 2) {
             if (!rng_chance(r, 0.55f)) continue;
             vec3 q = v3add(base, v3scale(dir_to_vec(side), sgn * CITY_TILE * 0.5f));
-            city__prop(w, fence, q, dir_to_yaw_along(side), fence->scale, PROP_FADE_MID);
-            phys_add_static_prop(phys, q, dir_to_yaw_along(side),
-                                 v2(CITY_TILE * 0.5f, 0.2f), 1.2f);
+            if (walled) {
+                city__run_barrier(w, phys, wall, q, side, 1.0f, PROP_FADE_MID);
+            } else if (fence) {
+                city__prop(w, fence, q, dir_to_yaw_along(side), fence->scale, PROP_FADE_MID);
+                phys_add_static_prop(phys, q, dir_to_yaw_along(side),
+                                     v2(CITY_TILE * 0.5f, 0.2f), 1.2f);
+            }
         }
     }
 
@@ -896,9 +1942,9 @@ static void city__dress_interior(city_world& w, const city_catalog& cat, phys_wo
     if (c.zone == ZONE_INDUSTRIAL) {
         if (rng_chance(r, 0.40f)) {
             const city_model* m = city_pick(cat, SET_INDUSTRIAL, rng_u32(r));
-            city__prop(w, m, centre, rng_range(r, 0.0f, 6.28f),
-                       m ? m->scale : 1.0f, PROP_FADE_MID);
-            phys_add_static_prop(phys, centre, 0.0f, v2(1.5f, 1.5f), 3.0f);
+            float yaw = rng_range(r, 0.0f, 6.28f);
+            city__prop(w, m, centre, yaw, m ? m->scale : 1.0f, PROP_FADE_MID);
+            city__collide_model(phys, m, centre, yaw, m ? m->scale : 1.0f);
         } else if (rng_chance(r, 0.35f)) {
             // something standing in the yard, squared up to the fence line
             city__parked_car(w, cat, phys, centre,
@@ -928,8 +1974,10 @@ static void city__dress_interior(city_world& w, const city_catalog& cat, phys_wo
         if (rng_chance(r, 0.22f)) {
             const city_model* m = city_get(cat, cat.singles[ONE_DUMPSTER]);
             vec3 q = v3add(centre, v3scale(across, 3.0f));
-            city__prop(w, m, q, bay_yaw, KIT_PROP_SCALE, PROP_FADE_NEAR);
-            phys_add_static_prop(phys, q, bay_yaw, v2(1.2f, 0.8f), 1.3f);
+            if (m) {
+                city__prop(w, m, q, bay_yaw, m->scale, PROP_FADE_NEAR);
+                city__collide_model(phys, m, q, bay_yaw, m->scale);
+            }
         }
         return;
     }
@@ -965,6 +2013,10 @@ static void city__dress_lots(city_world& w, const city_catalog& cat, phys_world&
             city_cell& c = city_at(w, x, z);
             rng r = rng_at(x, z, w.seed ^ 0x77E3u);
 
+            // A cell the park pass has already furnished is left alone: the
+            // scatter below has no idea a slide is standing there and would
+            // plant a tree through it.
+            if (c.flags & CELLF_FEATURE) continue;
             if (c.kind == CELL_PARK)  { city__dress_park(w, cat, phys, x, z, r); continue; }
             if (c.kind != CELL_LOT)   continue;
             if (c.flags & CELLF_OCCUPIED) continue;
@@ -1073,13 +2125,31 @@ static void city__lay_railway(city_world& w, const city_catalog& cat, phys_world
     const city_model* track = city_pick(cat, SET_RAILROAD, 0);
     if (!track || track->mesh == (idx)-1) return;
 
-    // the middle of the two-cell belt on the far side of the ring road
-    const int line_z = 1;
+    // The line used to run along z = 1, the belt outside the old ring road.
+    // On an archipelago that row is open sea, so the railway drew nothing at
+    // all. It goes instead down whichever row of the map carries the longest
+    // unbroken run of buildable land - which, because the industrial island
+    // is the widest thing that is not downtown, is usually right through it.
+    int line_z = 1, best_run = 0;
+    for (int z = 2; z < CITY_CELLS - 2; z++) {
+        int run = 0, longest = 0;
+        for (int x = 0; x < CITY_CELLS; x++) {
+            const city_cell& c = city_at(w, x, z);
+            bool open = c.kind == CELL_LOT || c.kind == CELL_PARK || c.kind == CELL_GROUND;
+            run = open ? run + 1 : 0;
+            if (run > longest) longest = run;
+        }
+        if (longest > best_run) { best_run = longest; line_z = z; }
+    }
+    if (best_run < 8) return;                    // nowhere on this map to lay it
     rng r = rng_at(line_z, 0, w.seed ^ 0x7A11u);
 
     for (int x = 0; x < CITY_CELLS; x++) {
         const city_cell& c = city_at(w, x, line_z);
-        if (c.kind == CELL_WATER) continue;          // the river gets there first
+        // open ground only: track laid over the sea, across a street or
+        // through somebody's front room is worse than no railway
+        if (c.kind == CELL_WATER || c.kind == CELL_ROAD || c.kind == CELL_SIDEWALK) continue;
+        if (c.flags & CELLF_OCCUPIED) continue;
         vec3 p = cell_centre(x, line_z, 0.02f);
         // the tile is authored running along its own +Z, so it is turned to lie
         // along the line
@@ -1092,8 +2162,20 @@ static void city__lay_railway(city_world& w, const city_catalog& cat, phys_world
     // One train, standing. Where it stands is decided from the seed so it is
     // somewhere different in every city, and it is laid out the way a train is:
     // a locomotive and then whatever it is pulling, nose to tail.
-    int head = rng_int(r, 12, CITY_CELLS - 30);
+    // Parked on the longest clear run of that row rather than at a random x,
+    // which on an island map is usually out at sea.
+    int head = 0, run = 0, best_start = -1, best_len = 0;
+    for (int x = 0; x < CITY_CELLS; x++) {
+        const city_cell& c = city_at(w, x, line_z);
+        bool clear = c.kind != CELL_WATER && c.kind != CELL_ROAD
+                  && c.kind != CELL_SIDEWALK && !(c.flags & CELLF_OCCUPIED);
+        run = clear ? run + 1 : 0;
+        if (run > best_len) { best_len = run; best_start = x - run + 1; }
+    }
+    if (best_start < 0 || best_len < 5) return;
     int cars = rng_int(r, 5, 9);
+    if (cars > best_len) cars = best_len;
+    head = best_start + rng_int(r, 0, best_len - cars);
     for (int i = 0; i < cars; i++) {
         int x = head + i;
         if (!city_in_bounds(x, line_z) || city_at(w, x, line_z).kind == CELL_WATER) break;
@@ -1162,12 +2244,38 @@ static void city__fence_water(city_world& w, const city_catalog& cat, phys_world
                 // embankment looks like; a garden fence on top of it turned the
                 // whole waterfront into a brick maze, and it was covering the
                 // one piece of geometry that was already saying "edge" clearly.
-                // something moored against the bank now and then
-                if (!decked && rng_chance(r, 0.10f)) {
-                    const city_model* boat = city_pick(cat, SET_PARK_FEATURE, 10);  // the canoe
-                    vec3 q = v3add(cell_centre(x, z, WATER_LEVEL - 0.05f),
-                                   v3scale(dir_to_vec(d), CITY_TILE * 0.28f));
-                    city__prop(w, boat, q, along_yaw, boat ? boat->scale : 1.0f, PROP_FADE_MID);
+                // ---- what is tied up along it ----
+                //
+                // A bank with nothing on it is a wall with water behind it.
+                // A jetty out over the water with a boat beside it is the
+                // cheapest thing that says the water is *used*, and it goes
+                // on the water cell rather than the land one, reaching back
+                // toward the bank it is moored to.
+                if (decked || !cat.sets[SET_WATERFRONT].count) continue;
+
+                const city_model* dock = city_get(cat, cat.singles[ONE_DOCK]);
+                const city_model* boat = city_get(cat, cat.singles[ONE_BOAT]);
+
+                if (dock && rng_chance(r, 0.09f)) {
+                    // pushed toward the bank, so the landward end of the
+                    // jetty meets the quay instead of floating in open water
+                    vec3 q = v3add(cell_centre(x, z, WATER_LEVEL - 0.15f),
+                                   v3scale(dir_to_vec(d), CITY_TILE * 0.22f));
+                    city__prop(w, dock, q, dir_to_yaw(d), dock->scale, PROP_FADE_MID);
+                    // A jetty is walkable in principle and nothing here can
+                    // walk on water, so it is a collider you bump into rather
+                    // than a surface you step onto - a box at deck height.
+                    city__collide_model(phys, dock, q, dir_to_yaw(d), dock->scale, 0.0f, 0.9f);
+
+                    if (boat && rng_chance(r, 0.6f)) {
+                        vec3 bq = v3add(q, v3scale(dir_to_vec((d + 1) & 3), CITY_TILE * 0.34f));
+                        bq.y = WATER_LEVEL - 0.35f;
+                        city__prop(w, boat, bq, along_yaw, boat->scale, PROP_FADE_MID);
+                    }
+                } else if (boat && rng_chance(r, 0.05f)) {
+                    vec3 q = v3add(cell_centre(x, z, WATER_LEVEL - 0.35f),
+                                   v3scale(dir_to_vec(d), CITY_TILE * 0.26f));
+                    city__prop(w, boat, q, along_yaw, boat->scale, PROP_FADE_MID);
                 }
             }
         }
@@ -1209,10 +2317,112 @@ static void city__index_navigation(city_world& w) {
         }
 }
 
+// ---- saved layouts ----
+//
+// A saved map is nothing but the kind and zone of every cell - the two
+// things a hand-edited layout actually specifies. Everything past that
+// (kerbs, facing, block grouping, which buildings, where the lamps go) is
+// re-derived by the same passes that already turn a *procedurally* laid out
+// grid into a city, which is what lets city_editor.hpp's map mode be nothing
+// more than a paint tool over kind and zone: it never has to know how a
+// building gets placed, only what street the lot faces.
+#define CITY_MAP_MAGIC    0x43495459u   // "CITY"
+#define CITY_MAP_VERSION  1u
+#define CITY_MAP_PATH     "citymap.sav"
+
+struct city_map_file_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t cells;      // CITY_CELLS at save time - a mismatch means "don't trust this file"
+};
+
+static bool city_save_layout(const city_world& w, const char* path = CITY_MAP_PATH) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+
+    city_map_file_header head = { CITY_MAP_MAGIC, CITY_MAP_VERSION, CITY_CELLS };
+    bool ok = fwrite(&head, sizeof(head), 1, f) == 1;
+    for (size_t i = 0; ok && i < CITY_CELLS * CITY_CELLS; i++) {
+        uint8_t kz[2] = { w.cells[i].kind, w.cells[i].zone };
+        ok = fwrite(kz, 1, 2, f) == 2;
+    }
+    fclose(f);
+    return ok;
+}
+
+// Only kind and zone come from the file; facing/kerb/depth are left at
+// whatever city_generate's caller already zeroed them to and are filled in
+// by city__derive_topology exactly as they are for a generated grid.
+static bool city__load_layout(city_world& w, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    city_map_file_header head;
+    bool ok = fread(&head, sizeof(head), 1, f) == 1
+           && head.magic == CITY_MAP_MAGIC && head.version == CITY_MAP_VERSION
+           && head.cells == CITY_CELLS;
+    for (size_t i = 0; ok && i < CITY_CELLS * CITY_CELLS; i++) {
+        uint8_t kz[2];
+        if (fread(kz, 1, 2, f) != 2) { ok = false; break; }
+        w.cells[i].kind = kz[0];
+        w.cells[i].zone = kz[1];
+    }
+    fclose(f);
+    return ok;
+}
+
+// city__place_buildings reads zone and density off a block, not off each
+// cell, for the same reason a street was built out of one facade at a time:
+// a lot-by-lot roll would paint every hand-placed building a different
+// colour. A hand-edited grid has no blocks of its own - city__subdivide is
+// what makes those, and it never ran - so this stands in for it by flooding
+// each run of same-zone lot cells into one, exactly as if a block boundary
+// had been drawn around it.
+static void city__derive_blocks_from_grid(city_world& w) {
+    static uint8_t visited[CITY_CELLS * CITY_CELLS];
+    static int stack[CITY_CELLS * CITY_CELLS];
+    memset(visited, 0, sizeof(visited));
+    w.block_count = 0;
+
+    for (int z = 0; z < CITY_CELLS; z++)
+        for (int x = 0; x < CITY_CELLS; x++) {
+            size_t start = (size_t)z * CITY_CELLS + x;
+            if (visited[start]) continue;
+            visited[start] = 1;
+            if (w.cells[start].kind != CELL_LOT) continue;
+
+            uint8_t zone = w.cells[start].zone;
+            int x0 = x, x1 = x, z0 = z, z1 = z;
+            int sp = 0;
+            stack[sp++] = x + z * CITY_CELLS;
+
+            while (sp > 0) {
+                int cell = stack[--sp];
+                int cx = cell % CITY_CELLS, cz = cell / CITY_CELLS;
+                if (cx < x0) x0 = cx; if (cx > x1) x1 = cx;
+                if (cz < z0) z0 = cz; if (cz > z1) z1 = cz;
+                for (int d = 0; d < 4; d++) {
+                    int nx = cx + DIR_DX[d], nz = cz + DIR_DZ[d];
+                    if (!city_in_bounds(nx, nz)) continue;
+                    size_t ni = (size_t)nz * CITY_CELLS + nx;
+                    if (visited[ni]) continue;
+                    visited[ni] = 1;
+                    if (w.cells[ni].kind != CELL_LOT || w.cells[ni].zone != zone) continue;
+                    stack[sp++] = nx + nz * CITY_CELLS;
+                }
+            }
+
+            if (w.block_count < CITY_MAX_BLOCKS) {
+                city_block& b = w.blocks[w.block_count++];
+                b.x0 = x0; b.z0 = z0; b.x1 = x1; b.z1 = z1;
+                b.zone = zone;
+            }
+        }
+}
+
 static void city_generate(city_world& w, const city_catalog& cat, phys_world& phys, uint32_t seed) {
     memset(&w, 0, sizeof(w));
     w.seed = seed;
-    rng r = rng_seed(seed);
 
     for (size_t i = 0; i < CITY_CELLS * CITY_CELLS; i++) {
         w.cells[i].kind = CELL_GROUND;
@@ -1221,30 +2431,46 @@ static void city_generate(city_world& w, const city_catalog& cat, phys_world& ph
         w.cells[i].kerb = DIR_NONE;
     }
 
-    // a ring road two cells in from the edge, so the city has an outside
-    const int LO = 2, HI = CITY_CELLS - 3;
-    for (int i = LO; i <= HI; i++) {
-        city_at(w, i, LO).kind = CELL_ROAD;
-        city_at(w, i, HI).kind = CELL_ROAD;
-        city_at(w, LO, i).kind = CELL_ROAD;
-        city_at(w, HI, i).kind = CELL_ROAD;
+    // A layout saved by the map editor takes over the whole shape of the
+    // city - the ring road, the river, every block - and skips straight to
+    // deriving blocks from whatever it painted. No file, or one that does
+    // not match this build's grid size, and the city is grown exactly as it
+    // always was.
+    if (city__load_layout(w, CITY_MAP_PATH)) {
+        // A hand-painted map has no islands of its own, but everything after
+        // this point still wants to know where the water is.
+        city__measure_shore(w);
+    } else {
+        rng r = rng_seed(seed);
+
+        // Land first, then the streets on it, then the bridges between: the
+        // coastline is the one thing every later pass has to accommodate,
+        // which is exactly the role the river used to play.
+        city__carve_islands(w, r);
+        city__clean_coast(w);
+        city__measure_shore(w);
+
+        for (size_t i = 0; i < w.island_count; i++)
+            city__lay_island_streets(w, r, (int)i);
+
+        city__connect_roads(w);
+        city__prune_roads(w);
+        city__zone_islands(w, r);
     }
 
-    // The river goes in first so the ring road, the subdivision and every
-    // block boundary have to accommodate it.
-    city__carve_river(w, r);
-    for (int i = LO; i <= HI; i++) {
-        if (city_at(w, i, LO).kind == CELL_WATER) city_at(w, i, LO).kind = CELL_ROAD;
-        if (city_at(w, i, HI).kind == CELL_WATER) city_at(w, i, HI).kind = CELL_ROAD;
-        if (city_at(w, LO, i).kind == CELL_WATER) city_at(w, LO, i).kind = CELL_ROAD;
-        if (city_at(w, HI, i).kind == CELL_WATER) city_at(w, HI, i).kind = CELL_ROAD;
-    }
-    city__subdivide(w, r, LO + 1, LO + 1, HI - 1, HI - 1, 0);
-
-    city__zone_blocks(w, r);
+    // One path from here on, hand-painted or generated: blocks are whatever
+    // the finished grid says they are.
+    city__derive_blocks_from_grid(w);
+    // Parks are taken out of the building stock before anything is built, and
+    // furnished after: what goes in one depends on where the topology pass
+    // put the pavement round it, and what does not go in one has to be known
+    // before the building pass runs or the park gets built on.
+    city__make_parks(w);
     city__build_bridges(w, cat, phys);
     city__derive_topology(w);
+    city__place_landmarks(w, cat, phys);
     city__place_buildings(w, cat, phys);
+    city__plan_parks(w, cat, phys);
     city__place_street_furniture(w, cat, phys);
     city__dress_lots(w, cat, phys);
     city__lay_railway(w, cat, phys);

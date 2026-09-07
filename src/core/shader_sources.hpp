@@ -30,6 +30,59 @@ void main() {
 // gradient, a ground half below the horizon, and the sun as a sharp disc with
 // two softer glow lobes around it. Everything downstream tonemaps and gamma
 // encodes in the post pass, so nothing here clamps.
+// ---- the per-frame block ----
+//
+// Everything about the frame that every shader agrees on - where the sun is,
+// what the sky is doing, where the camera stands, how the shadow cascades are
+// laid out - in one std140 uniform buffer, uploaded once and bound for the
+// whole frame.
+//
+// Before this it was thirty-odd glUniform calls *per program per pass*, each
+// one preceded by a glGetUniformLocation, which is a string lookup inside the
+// driver: the surface shader, the skinned shader, the water and the sky each
+// re-sent the same sun direction several times a frame, and the shadow and
+// reflection passes sent it again. None of it was per-draw data and none of it
+// changed between those calls.
+//
+// Everything in here is a vec4 or a mat4 on purpose. std140 pads a vec3 out to
+// sixteen bytes anyway and aligns arrays to sixteen, so packing by hand into
+// vec4s is not a saving - it is how the C side and the GLSL side are kept
+// obviously identical, which is the only real hazard with a uniform block.
+// The names the shaders already used are then macros onto the members, so the
+// bodies below read exactly as they did.
+const char* GLSL_SCENE = R"(
+layout(std140, binding = 0) uniform SceneBlock {
+    vec4 bSunDir;         // xyz normalised, toward the sun
+    vec4 bSunColor;       // rgb linear radiance
+    vec4 bSkyColor;       // rgb hemisphere irradiance from above
+    vec4 bGroundColor;    // rgb hemisphere irradiance bounced from below
+    vec4 bSkyZenith;      // rgb dome colour straight up
+    vec4 bSkyHorizon;     // rgb dome colour at the horizon
+    vec4 bFog;            // rgb colour, w density
+    vec4 bCamera;         // xyz eye, w wetness
+    vec4 bShadow;         // xy one atlas texel, z strength
+    mat4 bLightSpace[3];  // one projection per cascade, near to far
+    vec4 bCascadeFar;     // xyz view distance each cascade ends at
+    vec4 bCascadeTexel;   // xyz one shadow texel in world metres
+};
+
+#define uSunDir         bSunDir.xyz
+#define uSunColor       bSunColor.rgb
+#define uSkyColor       bSkyColor.rgb
+#define uGroundColor    bGroundColor.rgb
+#define uSkyZenith      bSkyZenith.rgb
+#define uSkyHorizon     bSkyHorizon.rgb
+#define uFogColor       bFog.rgb
+#define uFogDensity     bFog.w
+#define uCameraPos      bCamera.xyz
+#define uWetness        bCamera.w
+#define uShadowTexel    bShadow.xy
+#define uShadowStrength bShadow.z
+#define uLightSpace     bLightSpace
+#define uCascadeFar     bCascadeFar
+#define uCascadeTexel   bCascadeTexel
+)";
+
 const char* GLSL_COMMON = R"(
 vec3 srgb_to_linear(vec3 c) { return pow(max(c, 0.0), vec3(2.2)); }
 vec3 linear_to_srgb(vec3 c) { return pow(max(c, 0.0), vec3(1.0 / 2.2)); }
@@ -56,13 +109,13 @@ vec3 sky_env(vec3 dir, vec3 sunDir, vec3 sunColor, vec3 zenith, vec3 horizon, ve
 // one definition. Returns a pointer into a static buffer - compile it before
 // calling again.
 static const char* shader_with_common(const char* src) {
-    static char buf[16384];
+    static char buf[24576];
     const char* nl = strchr(src, '\n');
     if (!nl) return src;
     size_t head = (size_t)(nl - src) + 1;
     memcpy(buf, src, head);
     int n = (int)head;
-    n += sprintf(buf + n, "%s\n", GLSL_COMMON);
+    n += sprintf(buf + n, "%s\n%s\n", GLSL_SCENE, GLSL_COMMON);
     sprintf(buf + n, "%s", src + head);
     return buf;
 }
@@ -151,10 +204,16 @@ float light_falloff(float dist2, float radius) {
 // arrays, so binding a frame's lighting is three uploads and no per-light work
 // in the draw loop.
 const char* GLSL_LIGHTS = R"(
-uniform int  uLightCount;
-uniform vec4 uLightPosRadius[32];    // xyz position, w radius
-uniform vec4 uLightColorInner[32];   // rgb linear radiance, w cos(inner cone)
-uniform vec4 uLightDirOuter[32];     // xyz direction, w cos(outer cone), < -1 = point
+// The frame's punctual lights, in a block of their own rather than in the
+// scene block above: this one is rewritten every frame after the light list is
+// packed, and the two have no reason to share an upload.
+layout(std140, binding = 1) uniform LightBlock {
+    vec4 uLightPosRadius[32];    // xyz position, w radius
+    vec4 uLightColorInner[32];   // rgb linear radiance, w cos(inner cone)
+    vec4 uLightDirOuter[32];     // xyz direction, w cos(outer cone), < -1 = point
+    vec4 uLightMeta;             // x: how many of the above are live
+};
+#define uLightCount int(uLightMeta.x)
 
 vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, float a) {
     vec3 sum = vec3(0.0);
@@ -204,12 +263,9 @@ vec3 punctual_lights(vec3 world, vec3 n, vec3 v, vec3 diff_albedo, vec3 f0, floa
 //                  the resolution change is a soft band rather than a visible
 //                  line drawn across the ground.
 const char* GLSL_SHADOW = R"(
-uniform mat4      uLightSpace[3];
-uniform vec4      uCascadeFar;        // xyz: view distance each cascade ends at
-uniform vec4      uCascadeTexel;      // xyz: one shadow texel in world metres
+// The cascade projections, their ranges and the atlas texel size all live in
+// the scene block (GLSL_SCENE); the sampler is the one thing that cannot.
 uniform sampler2DShadow uShadowMap;
-uniform vec2      uShadowTexel;       // one texel of the whole atlas
-uniform float     uShadowStrength;
 
 float shadow_cascade(int c, vec3 world, vec3 n, float ndl) {
     // normal offset, scaled by how oblique the light is to this surface
@@ -269,7 +325,8 @@ static const char* shader_with_pbr(const char* src) {
     size_t head = (size_t)(nl - src) + 1;
     memcpy(out, src, head);
     int n = (int)head;
-    n += sprintf(out + n, "%s\n%s\n%s\n%s\n", GLSL_COMMON, GLSL_BRDF, GLSL_LIGHTS, GLSL_SHADOW);
+    n += sprintf(out + n, "%s\n%s\n%s\n%s\n%s\n",
+                 GLSL_SCENE, GLSL_COMMON, GLSL_BRDF, GLSL_LIGHTS, GLSL_SHADOW);
     sprintf(out + n, "%s", src + head);
     return out;
 }
@@ -299,29 +356,100 @@ uniform float uMetallic;
 uniform float uRoughness;
 uniform vec3  uEmissive;      // linear radiance added straight to the result
 uniform vec3  uWindowGlow;    // the same, but only out of the texture's dark patches
+uniform float uGlass;         // how far the texture's dark patches go toward glass
 
-uniform vec3  uSunDir;        // normalised, pointing toward the sun
-uniform vec3  uSunColor;      // linear radiance
-uniform vec3  uSkyColor;      // hemisphere diffuse irradiance, from above
-uniform vec3  uGroundColor;   // hemisphere diffuse irradiance, bounced from below
-uniform vec3  uSkyZenith;     // sky-dome colour straight up   (reflections)
-uniform vec3  uSkyHorizon;    // sky-dome colour at the horizon (reflections)
+// The sun, the sky, the fog and the camera all arrive in the scene block.
 
-uniform vec3  uCameraPos;
-uniform vec3  uFogColor;
-uniform float uFogDensity;
+// Used only by the water's planar reflection pass (see pix__reflection_pass):
+// a mirrored camera renders this same shader again, and anything below the
+// water's surface has to be discarded there - it is invisible to the real
+// camera, and left in it would show up as a mirrored island hanging in the
+// reflected sky. uClipSign is 0 for every ordinary draw, which multiplies the
+// test away entirely.
+uniform float uClipHeight;
+uniform float uClipSign;
+
+
+// Value noise over world XZ, for breaking the water film into puddles. A road
+// that is uniformly wet from kerb to kerb is a road that has been given a
+// different material, not one it has rained on: what says "rain" is that some
+// of it is holding water and some of it has already drained.
+float wet_hash(vec2 p) {
+    return fract(sin(dot(p, vec2(41.7, 289.1))) * 43758.5453);
+}
+float wet_noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = wet_hash(i), b = wet_hash(i + vec2(1.0, 0.0));
+    float c = wet_hash(i + vec2(0.0, 1.0)), d = wet_hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
 
 void main() {
+    if (uClipSign > 0.5 && vWorld.y < uClipHeight) discard;
     vec3 n = normalize(vNormal);
     vec3 v = normalize(uCameraPos - vWorld);
     float ndv = max(dot(n, v), 1e-4);
 
-    vec3  albedo = srgb_to_linear(texture(uTex, vUV).rgb * uColor);
+    // Cut-out foliage.
+    //
+    // Half the plants in the nature pack are alpha-masked cards - a leaf
+    // texture on a quad, with everything that is not leaf left transparent.
+    // Sampling only .rgb draws those transparent regions as opaque black,
+    // which is what turned every bush in the city into a ball of black and
+    // green shards. Nothing else in the art set has a base colour alpha below
+    // one, so a plain cut-out test is free for the rest of the world and is
+    // the whole fix for foliage.
+    vec4  tex = texture(uTex, vUV);
+    if (tex.a < 0.5) discard;
+
+    vec3  albedo = srgb_to_linear(tex.rgb * uColor);
     float rough  = clamp(uRoughness, 0.045, 1.0);
     float metal  = clamp(uMetallic, 0.0, 1.0);
+
+    // ---- wet ground ----
+    //
+    // A film of water does two opposite things at once, and a wet road only
+    // reads as wet when both are there. It fills the surface roughness in, so
+    // what was a diffuse grey sheet becomes close to a mirror - that is the
+    // reflection of the sky, the buildings and the headlights stretching down
+    // the carriageway. And it traps light by internal reflection, so the road
+    // underneath that mirror goes much darker than it was dry.
+    //
+    // Only faces the rain can land on, hence the n.y weight: a wall stays dry
+    // while the road it meets shines.
+    // ---- glazing ----
+    //
+    // The windows are painted into the same texture as the wall, so the only
+    // thing separating them is that glass is dark: it reflects the sky rather
+    // than scattering light back, and what a camera sees looking into a window
+    // in daylight is mostly a dim room. Cubed, so the separation is sharp - a
+    // dark swatch is glass and a merely shaded one is not - and the same term
+    // drives the lit-window glow further down, which is why it is computed
+    // once, here, rather than twice.
+    float dark = 1.0 - clamp(dot(albedo, vec3(0.2126, 0.7152, 0.0722)) * 6.0, 0.0, 1.0);
+    dark = dark * dark * dark;
+    float glass = uGlass * dark;
+    rough = mix(rough, 0.05, glass);
+
+    float wet = uWetness * clamp(n.y * 2.2 - 0.5, 0.0, 1.0);
+    // two scales of puddle: broad wet patches, and smaller pools inside them
+    float pud = wet_noise(vWorld.xz * 0.11) * 0.65 + wet_noise(vWorld.xz * 0.37) * 0.35;
+    float sheen = wet * mix(0.5, 1.0, smoothstep(0.3, 0.75, pud));
+    albedo *= mix(1.0, 0.32, sheen);
+    rough   = mix(rough, 0.035, sheen);
+
     float a      = rough * rough;
 
+    // A water film is its own dielectric surface sitting on top of whatever is
+    // underneath, so its reflectance is water at normal incidence rather than
+    // the road it covers - and, far more importantly, it is smooth enough for
+    // the Fresnel rise toward grazing angles to actually survive, which is the
+    // whole reason a wet street mirrors the skyline down its length.
     vec3 f0 = mix(vec3(0.04), albedo, metal);
+    f0 = mix(f0, vec3(0.05), sheen);
+    // glass is a stronger reflector than the plaster around it
+    f0 = mix(f0, vec3(0.08), glass);
     vec3 diff_albedo = albedo * (1.0 - metal);
 
     // ---- direct sun ----
@@ -349,16 +477,31 @@ void main() {
     // (Frostbite's horizon occlusion)
     float horizon = clamp(1.0 + dot(reflect(-v, n), n), 0.0, 1.0);
     vec3 amb_spec = env * env_brdf(f0, rough, ndv) * (horizon * horizon);
+    // Standing in for the reflection this renderer cannot give a road.
+    //
+    // Water reflects the whole scene - the buildings, the lamps, the cars -
+    // and the only environment a surface can sample here is the analytic sky.
+    // Under the overcast that comes with rain that sky is a flat grey dome, so
+    // a physically weighted mirror of it is indistinguishable from dry tarmac.
+    //
+    // The weighting is pushed onto the grazing angles rather than spread flat,
+    // because that is where a wet road actually reads as wet: the tarmac at
+    // your feet is dark and almost matte, and the mirror builds up along the
+    // carriageway until the far end of the street is a sheet of reflected sky.
+    // Brightening every angle equally just turns the road pale, which is dry
+    // concrete, not water.
+    float graze = 1.0 - ndv;
+    graze *= graze;
+    graze *= graze;
+    amb_spec *= 1.0 + sheen * (0.25 + 5.0 * graze);
 
     // down-facing crevices see less of the sky
     float ao = mix(0.45, 1.0, hemi);
 
-    // The window term. Cubed so the separation is sharp: a dark swatch keeps
-    // nearly all of it and a light one keeps an eighth, which reads as lit
-    // glass in a wall rather than as a wall that has been turned up.
-    float dark = 1.0 - clamp(dot(albedo, vec3(0.2126, 0.7152, 0.0722)) * 6.0, 0.0, 1.0);
+    // The window term rides on the same darkness test the glazing above uses:
+    // what is glass by day is what lights up after dark.
     vec3 color = direct + (amb_diffuse + amb_spec) * ao
-               + uEmissive + uWindowGlow * (dark * dark * dark);
+               + uEmissive + uWindowGlow * dark;
 
     float fog = 1.0 - exp(-view_depth * view_depth * uFogDensity * uFogDensity);
     frag = vec4(mix(color, srgb_to_linear(uFogColor), clamp(fog, 0.0, 1.0)), 1.0);
@@ -384,14 +527,7 @@ void main() {
 const char* FSHDER_SKY = R"(#version 440 core
 in vec2 vNDC;
 out vec4 frag;
-uniform mat4  uInvViewProj;
-uniform vec3  uCameraPos;
-uniform vec3  uSunDir;
-uniform vec3  uSunColor;
-uniform vec3  uSkyZenith;
-uniform vec3  uSkyHorizon;
-uniform vec3  uGroundColor;
-uniform vec3  uFogColor;
+uniform mat4  uInvViewProj;   // everything else it needs is in the scene block
 void main() {
     vec4 far = uInvViewProj * vec4(vNDC, 1.0, 1.0);
     vec3 dir = normalize(far.xyz / far.w - uCameraPos);
@@ -522,6 +658,45 @@ vec4 wave_field(vec2 p, float time) {
     // present in the geometry.
     return vec4(normalize(vec3(-dx * 14.0, 1.0, -dz * 14.0)), h);
 }
+
+// Same six waves, but built for a fragment that already knows how many world
+// metres one pixel covers (`footprint`, from fwidth of the world position).
+//
+// A river is looked at nearly edge-on from a walking camera, and world-space
+// derivatives explode toward the far bank the way they do for any ground
+// plane at a grazing angle. wave_field's finer octaves have wavelengths of a
+// couple of metres; once footprint approaches that, each pixel is sampling a
+// different point on the sine mid-cycle and the *unfiltered* normal - and the
+// tight specular lobe built from it - flickers between crest and trough from
+// one pixel to the next. That is the hard-edged diagonal banding a plain
+// wave_field() read on the water: it is aliasing, not ripple.
+//
+// The fix is the standard one for procedural normals: fade each octave out
+// once a pixel can no longer resolve it, so the normal degrades toward the
+// low-frequency swell (which stays smooth at any distance) instead of
+// aliasing. Height is untouched - only the fragment-stage normal needs this.
+vec3 wave_normal_aa(vec2 p, float time, float footprint) {
+    const vec2  D[6] = vec2[6](vec2( 0.80,  0.60), vec2(-0.45,  0.89),
+                               vec2( 0.99, -0.14), vec2( 0.20,  0.98),
+                               vec2( 0.71, -0.71), vec2(-0.92, -0.39));
+    const float F[6] = float[6](0.085, 0.130, 0.480, 0.730, 1.850, 2.410);
+    const float A[6] = float[6](0.300, 0.190, 0.070, 0.045, 0.016, 0.011);
+    const float S[6] = float[6](0.550, 0.410, 1.700, 2.300, 3.400, 4.100);
+
+    float dx = 0.0, dz = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        // ~2 pixels per wavelength is the Nyquist floor; start rolling the
+        // octave off well before that so the fade itself never aliases.
+        float wavelength = 6.28318531 / F[i];
+        float fade = 1.0 - smoothstep(wavelength * 0.25, wavelength * 1.0, footprint);
+        if (fade <= 0.001) continue;
+        float phase = dot(p, D[i]) * F[i] + time * S[i];
+        float c = cos(phase) * A[i] * F[i] * fade;
+        dx += c * D[i].x;
+        dz += c * D[i].y;
+    }
+    return normalize(vec3(-dx * 14.0, 1.0, -dz * 14.0));
+}
 )";
 
 // Splices both GLSL_COMMON and GLSL_WAVE in after the #version line.
@@ -531,7 +706,7 @@ vec4 wave_field(vec2 p, float time) {
 // to one opengl_create_shader call - and the water pass is the one place where
 // both stages need the same helper spliced in.
 static const char* shader_with_waves(const char* src) {
-    static char buf[2][16384];
+    static char buf[2][24576];
     static int  slot = 0;
     char* out = buf[slot];
     slot ^= 1;
@@ -541,7 +716,7 @@ static const char* shader_with_waves(const char* src) {
     size_t head = (size_t)(nl - src) + 1;
     memcpy(out, src, head);
     int n = (int)head;
-    n += sprintf(out + n, "%s\n%s\n", GLSL_COMMON, GLSL_WAVE);
+    n += sprintf(out + n, "%s\n%s\n%s\n", GLSL_SCENE, GLSL_COMMON, GLSL_WAVE);
     sprintf(out + n, "%s", src + head);
     return out;
 }
@@ -568,37 +743,58 @@ void main() {
 const char* FSHDER_WATER = R"(#version 440 core
 in vec3 vWorld;
 out vec4 frag;
-uniform vec3  uCameraPos;
-uniform vec3  uSunDir;
-uniform vec3  uSunColor;
 uniform vec3  uShallowColor;
 uniform vec3  uDeepColor;
-uniform vec3  uSkyZenith;
-uniform vec3  uSkyHorizon;
-uniform vec3  uGroundColor;
-uniform vec3  uFogColor;
-uniform float uFogDensity;
 uniform float uTime;
 uniform float uBedDepth;      // metres from the surface down to the bed
 
+// The planar reflection captured this frame by pix__reflection_pass: the
+// opaque scene and sky, drawn again from a camera mirrored across the water's
+// surface. A water fragment finds its own reflection the way any projected
+// texture is looked up: run its world position through that camera's own
+// view-projection to get back the screen position *it* was drawn at, and
+// sample there. That is where the skyline and the buildings across the river
+// actually come from; the analytic sky_env is kept only as what fills the
+// gaps - outside the sun's cone, past the far edge of the frustum, or
+// whenever the pass did not run this frame (effects off, no camera above the
+// water to mirror).
+uniform sampler2D uReflection;
+uniform mat4      uReflViewProj;
+uniform float     uReflectionMix;   // 0 = analytic sky only, 1 = captured reflection
+
 void main() {
     vec4 wave = wave_field(vWorld.xz, uTime);
-    vec3 n = wave.xyz;
+    // How many world metres one screen pixel spans here - large at a distant,
+    // near-grazing view of the surface, small underfoot. Feeds the fade in
+    // wave_normal_aa so the shading normal never carries more ripple detail
+    // than this pixel could actually resolve; see that function for why.
+    float footprint = max(fwidth(vWorld.x), fwidth(vWorld.z));
+    vec3 n = wave_normal_aa(vWorld.xz, uTime, footprint);
     vec3 view = normalize(uCameraPos - vWorld);
 
-    // Schlick. The 0.02 base is water's real normal-incidence reflectance; the
-    // swing to ~1 at grazing angles is what sells it as a liquid surface.
-    float fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 5.0);
+    // Schlick, with the floor raised a little past water's real ~0.02
+    // normal-incidence reflectance: the planar reflection now genuinely
+    // carries the scene, so straight-down water is worth showing more of it
+    // rather than mostly the body colour underneath.
+    float fresnel = 0.06 + 0.94 * pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 5.0);
 
     // How far the eye is looking through the water: straight down it is the
     // depth to the bed, at a glancing angle it is far further, and that is what
     // makes the far side of a river read darker than the near edge. Wave height
     // rides on top of it, so a crest is lighter than the trough beside it.
     float through = uBedDepth / max(abs(view.y), 0.06);
-    float murk = 1.0 - exp(-through * 0.42);
+    float murk = 1.0 - exp(-through * 0.30);
     float crest = clamp(wave.w * 1.3 + 0.5, 0.0, 1.0);
     vec3 body = mix(srgb_to_linear(uShallowColor), srgb_to_linear(uDeepColor),
                     clamp(murk - crest * 0.25, 0.0, 1.0));
+    // The body colour is a fixed pigment, but what lights it is not: the same
+    // silty water is bright jade at noon and nearly black by starlight. Tying
+    // it to the sky's own brightness (already on hand as uSkyZenith, for the
+    // reflection above) is what keeps the stretch of river nearest the camera
+    // - where the low fresnel above leaves the body colour dominant - from
+    // reading as a flat, time-of-day-blind black pool in broad daylight.
+    float sky_luma = dot(uSkyZenith, vec3(0.2126, 0.7152, 0.0722));
+    body *= clamp(mix(0.4, 1.6, sky_luma / 1.8), 0.4, 1.7);
 
     // The reflection is a real mirror sample of the same analytic sky the
     // backdrop and every other surface use, taken along the wave-perturbed
@@ -610,21 +806,62 @@ void main() {
     // back and the rest goes into the body of the water.
     vec3 refl = reflect(-view, n);
     refl.y = abs(refl.y);   // waves that tilt the normal below horizontal still see sky
-    vec3 sky = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor) * 0.78;
+    vec3 analytic_sky = sky_env(refl, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uGroundColor);
+
+    // Project this point of the surface - nudged sideways by the wave normal,
+    // so the skyline shimmers and breaks up with the same ripple that shapes
+    // the sun glitter below - through the reflection camera's own matrix to
+    // find where it was drawn in reflection_target. Skipped entirely when the
+    // pass did not run this frame: uReflViewProj is then stale, and dividing
+    // by a stale w is exactly the kind of thing that produces a NaN that
+    // mix()'s zero weight would not actually protect against.
+    vec3 captured = vec3(0.0);
+    if (uReflectionMix > 0.5) {
+        vec3 sample_at = vWorld + vec3(n.x, 0.0, n.z) * 0.6;
+        vec4 rc = uReflViewProj * vec4(sample_at, 1.0);
+        vec2 refl_uv = clamp((rc.xy / max(rc.w, 1e-4)) * 0.5 + 0.5, vec2(0.003), vec2(0.997));
+        // A manual mip bias on top of whatever the hardware's own derivative
+        // picks: the UV came out of a perspective divide rather than a plain
+        // varying, so its screen-space derivative - and therefore automatic
+        // mip selection - is not as reliable a measure of this fragment's
+        // real footprint in the capture as it would be for an ordinary
+        // texture lookup. Forcing a couple of extra mips softens it in every
+        // case rather than only the ones the derivative happens to catch.
+        captured = texture(uReflection, refl_uv, 1.6).rgb;
+    }
+    // Pulled down further than the analytic-only version needed: a captured
+    // reflection is a real, high-contrast photo of the scene rather than a
+    // soft sky gradient, and returning it at the same strength read as
+    // polished metal even with the mip-blurred capture and the wave
+    // distortion above. Held back more, and blended with a fifth of the
+    // still-perfectly-smooth analytic sky even when the capture is
+    // available, it settles back into looking like a reflection *in* water
+    // rather than a mirror sitting on top of it.
+    vec3 sky = mix(analytic_sky, mix(analytic_sky, captured, 0.8), uReflectionMix) * 0.62;
 
     vec3 half_v = normalize(uSunDir + view);
     // Two lobes, both kept modest. A very tight, very bright highlight on a
     // surface whose waves are smaller than a pixel at any distance does not
     // sparkle, it smears into a chrome band across the whole river.
+    //
+    // The glitter lobe's own exponent is widened with distance too, in step
+    // with wave_normal_aa's fade above: a filtered normal removes the
+    // per-pixel flicker in the normal itself, but a pow(x, 200) highlight
+    // built from it can still crawl as the (now-smoother) normal sweeps a
+    // whole lobe-width between neighbouring pixels. Softening the lobe as
+    // footprint grows keeps the sun glitter as a sparkle near the bank and a
+    // calm, broad sheen toward the far side rather than a hard band.
+    float far = clamp(footprint / 3.0, 0.0, 1.0);
+    float glitter_pow = mix(200.0, 24.0, far);
     float ndh = max(dot(n, half_v), 0.0);
-    float spec = pow(ndh, 200.0) * 1.6;      // sun glitter
-    spec += pow(ndh, 18.0) * 0.06;           // broad sheen
+    float spec = pow(ndh, glitter_pow) * mix(1.6, 0.5, far);   // sun glitter
+    spec += pow(ndh, 18.0) * 0.06;                             // broad sheen
 
     // Never a pure reflection even edge on. Some of what comes back off water at
     // a glancing angle is still the water, and holding a little of the body
     // colour in is what keeps a river reading as a river rather than as a strip
     // of polished metal laid in the ground.
-    vec3 color = mix(body, sky, fresnel * 0.88) + uSunColor * spec;
+    vec3 color = mix(body, sky, fresnel * 0.80) + uSunColor * spec;
 
     // atmospheric fog only at real distance - the near-field colour above is
     // left alone so nearby water still reads as water, not haze
@@ -712,6 +949,59 @@ uniform float uVignette;
 uniform float uSharpen;
 uniform float uBloomStrength;
 
+// ---- rain ----
+//
+// Screen space, not particles. Rain seen from a chase camera is a wall of
+// near-identical streaks with no parallax worth the name, so simulating it in
+// world space buys nothing a scrolling noise field does not already give, and
+// costs a draw call and a buffer per frame. uRain is the downpour, 0..1.
+uniform float uRain;
+uniform float uTime;
+
+float rain_hash(vec2 p) {
+    return fract(sin(dot(p, vec2(41.7, 289.1))) * 43758.5453);
+}
+
+// One layer of falling drops.
+//
+// The screen is cut into columns; a column is a stream of drops, each one a
+// short comet - bright at the leading end, fading out behind it, which is what
+// a real drop looks like on any exposure long enough to see it at all. The two
+// things that make this read as rain rather than as noise are that a drop is
+// far shorter than the gap to the next one in its column, and that it is
+// roughly a pixel and a half wide however far away the layer is meant to be.
+//
+// `uv` arrives aspect corrected, so a column is as wide on screen as it is
+// tall-per-unit, and a streak stays vertical instead of shearing with the
+// window. `rows` is how many drop-lengths fit down the screen, so it and
+// `len` together set both the length of a drop and the spacing between drops.
+float rain_layer(vec2 uv, float cols, float rows, float speed, float len,
+                 float wind, float seed) {
+    vec2 g = vec2((uv.x + uv.y * wind) * cols + seed * 13.7, uv.y * rows);
+
+    float col = floor(g.x);
+    float r1 = rain_hash(vec2(col, seed));
+
+    // Plus, not minus: vUV.y here is the fullscreen triangle's clip-space y,
+    // so it runs bottom to top and scrolling the field the intuitive way sends
+    // the rain up into the sky. The r1 term offsets each column by a random
+    // amount so neighbouring columns are not falling in step.
+    float y = g.y + uTime * speed * (0.75 + r1 * 0.55) + r1 * 41.0;
+    float row = floor(y);
+
+    // Whether this slot carries a drop at all is rolled per (column, slot), so
+    // the spacing down a column is irregular. A drop in every slot is a grid,
+    // and a grid reads as a texture stuck to the screen.
+    float present = rain_hash(vec2(col, row * 1.7 + seed));
+    if (present < 0.45) return 0.0;
+
+    float fy = fract(y);
+    float streak = smoothstep(len, 0.0, fy);              // head at fy 0, tail behind
+    float across = smoothstep(0.05, 0.0, abs(fract(g.x) - 0.5));
+    // and not every drop the same brightness - depth within the layer
+    return streak * across * (0.45 + present * 0.55);
+}
+
 // Narkowicz's fit of the ACES filmic curve: cheap, and it rolls highlights off
 // instead of clipping them flat white the way a plain clamp does
 vec3 tonemap(vec3 x) {
@@ -742,6 +1032,31 @@ void main() {
 
     float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
     color = mix(vec3(luma), color, uSaturation);
+
+    if (uRain > 0.001) {
+        // Aspect corrected, so a streak is vertical and a pixel wide at any
+        // window shape, and slanted per layer: rain that all falls at exactly
+        // one angle looks painted on, and rain that falls straight down looks
+        // like it is in a lift shaft.
+        float aspect = uTexel.y / uTexel.x;
+        vec2 ruv = vec2(vUV.x * aspect, vUV.y);
+
+        // three depths. The near layer is long, fast, sparse and bright; the
+        // far one is short, slow, dense and dim, which is what puts distance
+        // between them - a single layer at any setting reads as a flat sheet.
+        float drops = rain_layer(ruv,  70.0,  6.5, 2.9, 0.62, 0.16, 0.0) * 1.00
+                    + rain_layer(ruv, 130.0, 12.0, 2.2, 0.50, 0.21, 3.0) * 0.62
+                    + rain_layer(ruv, 240.0, 22.0, 1.7, 0.42, 0.26, 8.0) * 0.36;
+
+        // A drop is not a light source; it is a lens full of whatever is
+        // behind it, which in daylight is mostly the sky. Scaling by the local
+        // brightness is what keeps rain at noon bright, rain against a dark
+        // building dim, and rain at night nearly invisible except where a lamp
+        // catches it - all of which a fixed grey gets wrong.
+        float lit = clamp(luma * 1.5 + 0.20, 0.0, 1.5);
+        float wash = clamp(drops * uRain, 0.0, 1.0);
+        color = mix(color, color * 0.88 + vec3(0.62, 0.68, 0.80) * lit * 0.55, wash);
+    }
 
     vec2 d = vUV - 0.5;
     color *= 1.0 - uVignette * dot(d, d);
@@ -834,5 +1149,51 @@ void main() {
     vec3 rgb = mix(uOutlineColor.rgb, uColor.rgb, t);
     float alpha = outlineAlpha * mix(uOutlineColor.a, uColor.a, t);
     frag = vec4(rgb, alpha);
+}
+)";
+
+// ---- particles ----
+//
+// One camera-facing quad per particle, four vertices apiece, with no vertex
+// buffer at all: the corner is derived from gl_VertexID and everything else is
+// per-instance. That is deliberate - a muzzle flash is a handful of quads that
+// live for a tenth of a second, and the cheapest thing a system like that can
+// do is not touch a mesh pool it would immediately have to give back.
+//
+// Colour is linear radiance and is not clamped, so a flash written at 14.0
+// blows straight through the bloom threshold and glares, while smoke written
+// at 0.05 sits under it and does not. Which is the whole reason particles are
+// drawn into the HDR target rather than composited afterwards.
+const char* VSHDER_PARTICLE = R"(#version 440 core
+layout(location=0) in vec4 aCentreSize;   // xyz world centre, w half-size in metres
+layout(location=1) in vec4 aColor;        // rgb linear radiance, a coverage
+uniform mat4 uViewProj;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+out vec2 vUV;
+out vec4 vColor;
+void main() {
+    // 0,1,2,3 as a triangle strip: (-1,-1) (1,-1) (-1,1) (1,1)
+    vec2 corner = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,
+                       (gl_VertexID & 2) == 0 ? -1.0 : 1.0);
+    vUV = corner;
+    vColor = aColor;
+    vec3 world = aCentreSize.xyz + (uCamRight * corner.x + uCamUp * corner.y) * aCentreSize.w;
+    gl_Position = uViewProj * vec4(world, 1.0);
+}
+)";
+
+// A soft round blob rather than a square: the quad is only a carrier, and the
+// squared falloff is what keeps a spark from reading as a pixel and a smoke
+// puff from reading as a card.
+const char* FSHDER_PARTICLE = R"(#version 440 core
+in vec2 vUV;
+in vec4 vColor;
+out vec4 frag;
+void main() {
+    float r2 = dot(vUV, vUV);
+    if (r2 > 1.0) discard;
+    float falloff = 1.0 - r2;
+    frag = vec4(vColor.rgb, vColor.a * falloff * falloff);
 }
 )";

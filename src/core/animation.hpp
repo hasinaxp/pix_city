@@ -1,5 +1,6 @@
 #pragma once
 #include <math.h>
+#include <string.h>
 #include "dtype.hpp"
 #include "math.hpp"
 #include "../loader/asset_types.hpp"
@@ -12,9 +13,11 @@
 // clip's tracks are dense - tracks[i] belongs to bone i, so there is no lookup.
 
 #define MAX_ANIM_BONES     128  // must match the uBones[] size in shader_sources.hpp
-// the Quaternius character rigs ship 24 clips each; 16 silently dropped a third
-// of them, including every clip past Roll in their export order
-#define MAX_ANIMATOR_CLIPS 32
+// The Quaternius character rigs ship 24 clips each (16 silently dropped a
+// third of them, including every clip past Roll in their export order), plus
+// up to CITY_MAX_BORROWED retargeted from another rig for the roles this one
+// does not ship at all.
+#define MAX_ANIMATOR_CLIPS 40
 
 // a resolved pose: bones[i] = global_transform(i) * inverse_bind(i)
 struct animation {
@@ -236,4 +239,30 @@ static void animator_update(animator& a, float dt) {
         }
     }
     animator_sample(a, a.clip, a.time, &a.pose);
+}
+
+// ---- attaching something to a bone ----
+//
+// A pose holds skinning matrices - global(i) * inverse_bind(i) - because that
+// is what the vertex shader wants and nothing else needed anything more. A
+// gun in a hand does: it has to be placed at the *global* transform of the
+// wrist, in the character's own model space, and the skinning matrix is that
+// transform with the bind pose already divided out of it. Multiplying the
+// bind pose back in is what these two do.
+//
+// One 4x4 inverse per lookup, and the only thing in the game that asks is the
+// player's own hand, once a frame.
+static int animator_find_bone(const animator& a, const char* const* names, int count) {
+    if (!a.skeleton) return -1;
+    for (int n = 0; n < count; n++) {
+        if (!names[n]) break;
+        for (size_t i = 0; i < a.skeleton->bone_count; i++)
+            if (strcmp(a.skeleton->bones[i].name, names[n]) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static mat4 animation_bone_world(const animator& a, const animation& pose, int bone) {
+    if (!a.skeleton || bone < 0 || (size_t)bone >= pose.bone_count) return mat4_identity();
+    return mat4_mul(pose.bones[bone], mat4_inverse(a.skeleton->bones[bone].inverse_bind));
 }

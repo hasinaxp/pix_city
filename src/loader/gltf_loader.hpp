@@ -35,7 +35,31 @@ struct gltf_result {
     bool                      image_is_palette; // sample it with NEAREST, not LINEAR
 };
 
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out);
+// `only_node` restricts the load to one mesh node instead of merging every
+// one the file has - see the definition for why a library file needs this.
+//
+// `only_material` restricts it further, to the primitives painted with one
+// glTF material. A model built out of two materials - a tree's bark and its
+// leaves, say - has two textures, and a merged single-texture draw can only
+// ever wear one of them: the leaves come out painted in tiled bark, which is
+// what made every tree in this city look like scribble. The caller loads such
+// a file once per material and draws the results together; see
+// city__add_model_gltf.
+static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+                           int only_node = -1, int only_material = -1);
+
+// The distinct materials used by a file's mesh primitives, in first-seen
+// order. `node` narrows it to one mesh node, or -1 for the whole file.
+// Returns how many were written, capped at `max_out`.
+static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+                               int* out, int max_out);
+
+// Every mesh-carrying node's name and index, for a caller that needs to pick
+// one out of a file by name before it can hand that index to gltf_load_file
+// as `only_node` - see city__add_model_gltf_node in city_assets.hpp. Returns
+// the number of names written, capped at `max_out`.
+struct gltf_node_info { char name[64]; int node; };
+static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out);
 
 // ---------------- json ----------------
 
@@ -576,7 +600,53 @@ static void gltf__palette_pixels(const gltf__palette& p, unsigned char* rgba) {
 
 // ---------------- load ----------------
 
-static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out) {
+static int gltf_list_nodes(mem_arena& arena, const char* path, gltf_node_info* out, int max_out) {
+    gltf_file g;
+    if (!gltf__open(arena, path, &g)) return 0;
+    const js_doc& d = g.json;
+    int nodes = js_get(d, g.root, "nodes");
+    int node_count = js_len(d, nodes);
+    int found = 0;
+    for (int i = 0; i < node_count && found < max_out; i++) {
+        int n = gltf__node(g, i);
+        if (js_get(d, n, "mesh") < 0) continue;
+        js_str(d, js_get(d, n, "name"), out[found].name, sizeof(out[found].name));
+        out[found].node = i;
+        found++;
+    }
+    return found;
+}
+
+static int gltf_list_materials(mem_arena& arena, const char* path, int node,
+                               int* out, int max_out) {
+    gltf_file g;
+    if (!gltf__open(arena, path, &g)) return 0;
+    const js_doc& d = g.json;
+
+    int found = 0;
+    int node_count = js_len(d, js_get(d, g.root, "nodes"));
+    for (int i = 0; i < node_count && found < max_out; i++) {
+        if (node >= 0 && i != node) continue;
+        int n = gltf__node(g, i);
+        int mesh_index = js_int(d, js_get(d, n, "mesh"), -1);
+        if (mesh_index < 0) continue;
+        int mesh = js_at(d, js_get(d, g.root, "meshes"), mesh_index);
+        int prims = js_get(d, mesh, "primitives");
+        for (int p = 0, pc = js_len(d, prims); p < pc && found < max_out; p++) {
+            int prim = js_at(d, prims, p);
+            if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue;
+            int mat = js_int(d, js_get(d, prim, "material"), -1);
+            if (mat < 0) continue;
+            bool seen = false;
+            for (int k = 0; k < found; k++) if (out[k] == mat) seen = true;
+            if (!seen) out[found++] = mat;
+        }
+    }
+    return found;
+}
+
+static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out,
+                           int only_node, int only_material) {
     *out = gltf_result();
     out->skeleton.root_transform = mat4_identity();
 
@@ -603,10 +673,18 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
     // Every node carrying a mesh, not just the first. A character is routinely
     // authored as several meshes over one armature - body, head, legs, feet -
     // and taking only one of them loads a torso with no head.
+    //
+    // `only_node` narrows this to one - some packs ship a whole family of
+    // props as siblings in a single file (five birch trees standing in a row
+    // so an artist could preview them together, say), and merging every
+    // sibling the way a multi-mesh character wants would draw all five
+    // wherever one was asked for. The caller finds the family with
+    // gltf_list_nodes and loads each member on its own by index.
     int32_t* mesh_nodes = allocate<int32_t>(arena, (size_t)node_count);
     if (!mesh_nodes) return false;
     int mesh_node_count = 0, skin_index = -1;
     for (int i = 0; i < node_count; i++) {
+        if (only_node >= 0 && i != only_node) continue;
         int n = gltf__node(g, i);
         if (js_get(d, n, "mesh") < 0) continue;
         mesh_nodes[mesh_node_count++] = (int32_t)i;
@@ -711,6 +789,8 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
         for (int p = 0, pc = js_len(d, prims); p < pc; p++) {
             int prim = js_at(d, prims, p);
             if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue; // triangles only
+            if (only_material >= 0
+                && js_int(d, js_get(d, prim, "material"), -1) != only_material) continue;
             int pos_acc = js_int(d, js_get(d, js_get(d, prim, "attributes"), "POSITION"), -1);
             size_t vc = gltf__accessor_count(g, pos_acc);
             if (!vc) continue;
@@ -765,11 +845,19 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
         if (bake_place)
             for (int n = node_index; n >= 0; n = parent[n])
                 place = mat4_mul(gltf__node_matrix(g, gltf__node(g, n)), place);
+        // Pulled out of a gallery row, a single node keeps its rotation and
+        // scale but drops the translation that used to stand it next to its
+        // siblings - it needs to sit at its own local origin, ready for a
+        // caller's own placement transform, not still offset by where it
+        // happened to be parked in the source file.
+        if (only_node >= 0) { place.data[12] = 0.0f; place.data[13] = 0.0f; place.data[14] = 0.0f; }
 
         int prims = js_get(d, mesh, "primitives");
         for (int p = 0, pc = js_len(d, prims); p < pc; p++) {
             int prim = js_at(d, prims, p);
             if (js_int(d, js_get(d, prim, "mode"), 4) != 4) continue;
+            if (only_material >= 0
+                && js_int(d, js_get(d, prim, "material"), -1) != only_material) continue;
             int attrs = js_get(d, prim, "attributes");
             int pos_acc = js_int(d, js_get(d, attrs, "POSITION"), -1);
             size_t vc = gltf__accessor_count(g, pos_acc);
@@ -1004,10 +1092,18 @@ static bool gltf_load_file(mem_arena& arena, const char* path, gltf_result* out)
     // ---- base colour texture, if it is a png we can decode ----
     if (use_palette) return true;    // the generated palette above is the texture
 
-    int mesh0 = js_at(d, js_get(d, g.root, "meshes"),
-                      js_int(d, js_get(d, gltf__node(g, mesh_nodes[0]), "mesh"), -1));
-    int prim0 = js_at(d, js_get(d, mesh0, "primitives"), 0);
-    int tex_index = gltf__base_color_texture(g, js_int(d, js_get(d, prim0, "material"), -1));
+    int tex_index = -1;
+    if (only_material >= 0) {
+        tex_index = gltf__base_color_texture(g, only_material);
+    } else {
+        // No material was asked for, so the first primitive's is as good a
+        // guess as there is - and is exactly right for the single-material
+        // files that are most of this project's art.
+        int mesh0 = js_at(d, js_get(d, g.root, "meshes"),
+                          js_int(d, js_get(d, gltf__node(g, mesh_nodes[0]), "mesh"), -1));
+        int prim0 = js_at(d, js_get(d, mesh0, "primitives"), 0);
+        tex_index = gltf__base_color_texture(g, js_int(d, js_get(d, prim0, "material"), -1));
+    }
     int tex = js_at(d, js_get(d, g.root, "textures"), tex_index);
     int img_index = js_int(d, js_get(d, tex, "source"), -1);
     int img = js_at(d, js_get(d, g.root, "images"), img_index);

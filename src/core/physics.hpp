@@ -5,6 +5,7 @@
 #include "dtype.hpp"
 #include "math.hpp"
 #include "colliders.hpp"
+#include "jobs.hpp"
 
 // A small, allocation-light physics world for a walk-around / drive-around
 // game: an immovable set of axis aligned boxes (buildings, walls, props) plus
@@ -23,6 +24,25 @@
 // The shape maths lives in colliders.hpp; this file is only the simulation
 // built on top of it - integration, broadphase, and turning contacts into
 // motion. No third-party code.
+//
+// ---- what is threaded, and what is not ----
+//
+// Hand the world a pix_jobs pool and two of the three phases split across it.
+// Which two is decided by what each phase writes, not by what it costs:
+//
+//   integration       body i writes body i. Independent, so parallel.
+//   static contacts   body i writes body i and *reads* the static grid, which
+//                     nothing mutates during a step. Independent, so parallel,
+//                     and it is also the expensive phase - a body in a street
+//                     tests against every kerb, wall and lamp post near it.
+//   dynamic contacts  resolving a pair writes to *both* bodies, so two
+//                     threads holding overlapping pairs would race. This one
+//                     stays on the calling thread. It is also the cheaper of
+//                     the two: there are a few hundred dynamic bodies against
+//                     tens of thousands of statics.
+//
+// Splitting only what is provably independent is why there is not a lock
+// anywhere in the step.
 
 #define PHYS_MAX_BODIES    2048
 #define PHYS_MAX_STATICS   32768
@@ -51,20 +71,43 @@ struct phys_body {
     float inv_mass;      // 0 = immovable
     float restitution;   // 0 = dead stop, 1 = perfect bounce
     float drag;          // per-second velocity damping applied to XZ
+    // Coulomb friction at a contact, as a fraction of the normal impulse.
+    // Without it two bodies in contact slide across each other freely, which
+    // is why a crowd used to glide sideways off a car's flank instead of
+    // being dragged along it.
+    float friction;
 
     uint8_t shape;
     bool    active;
     bool    gravity;     // characters and loose props yes, driven vehicles yes, ghosts no
     bool    on_ground;
     bool    touched;     // set by the solver whenever anything pushed this body this step
+    // Largest normal impulse this body took this step, in metres per second
+    // of velocity change. Game code reads it to tell a shove from a crash
+    // without having to watch for the collision itself.
+    float   impact;
 
     uint16_t group;
     uint16_t collides;
     void*    user;       // owner (ped, car, ...) so a hit can be traced back
 };
 
+// The true footprint of a static, kept beside its axis-aligned bound.
+//
+// The broadphase grid and the raycaster want an AABB and always will. The
+// narrowphase does not: a prop dropped at 40 degrees has an AABB a third
+// wider than the thing itself in both directions, and walking into that is
+// being stopped by air a foot short of a lamp post. So the AABB stays as the
+// coarse bound and this carries what the collider actually is.
+struct phys_static_shape {
+    vec2  half;      // local half extents in XZ
+    float yaw;
+    bool  rotated;   // false for a box added axis-aligned; skips the OBB path
+};
+
 struct phys_world {
     aabb   statics[PHYS_MAX_STATICS];
+    phys_static_shape static_shape[PHYS_MAX_STATICS];
     size_t      static_count;
 
     // static uniform grid, built by phys_build_statics
@@ -83,6 +126,20 @@ struct phys_world {
     vec3  gravity;
     float ground_y;
     float step_height;    // statics shorter than this are stepped over, not blocked
+
+    // Where the floor is, if it is not flat.
+    //
+    // The city's roads sit a few centimetres below its pavements and its
+    // bridges carry a deck over open water, so one `ground_y` for the whole
+    // map put everybody on the pavement plane - people crossing a street
+    // walked over the kerb rather than down off it. This is the hook that
+    // fixes it: return the height of the ground under (x, z). It is called
+    // from the integration phase, which is threaded, so it must only read.
+    float (*ground_at)(void* user, float x, float z);
+    void*  ground_user;
+
+    // Optional; without one every phase runs on the calling thread.
+    pix_jobs* jobs;
 };
 
 static void phys_create_world(phys_world& w);
@@ -92,6 +149,9 @@ static void phys_add_static_box(phys_world& w, vec3 min, vec3 max);
 // convenience: a yawed footprint, stored as its axis aligned bound
 static void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height);
 static void phys_build_statics(phys_world& w);
+// drops every static collider (not the dynamic bodies) so the world can be
+// regenerated in place - see the definition for why this has to exist
+static void phys_reset_statics(phys_world& w);
 
 static idx  phys_add_body(phys_world& w, const phys_body& body);
 static phys_body* phys_get_body(phys_world& w, idx id);
@@ -113,6 +173,18 @@ static size_t phys_query_neighbours(const phys_world& w, vec3 centre, float radi
 // true when an upright cylinder placed here would intersect static geometry
 static bool phys_point_blocked(const phys_world& w, vec3 position, float radius, float height);
 
+// The first *dynamic* body a ray meets - a person, a car - as opposed to
+// phys_raycast above, which only ever sees the static world. A bullet needs
+// both and needs to know which came first, so it asks each in turn; nothing
+// before shooting existed did, which is why this is the newer of the two.
+//
+// `ignore` is skipped outright (the shooter's own collider). `mask` is a
+// layer filter: pass PHYS_LAYER_PED | PHYS_LAYER_VEHICLE to hit people and
+// traffic and nothing else.
+static idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
+                               float max_distance, uint16_t mask, idx ignore,
+                               float* out_distance);
+
 // ---------------- implementation ----------------
 
 static void phys_create_world(phys_world& w) {
@@ -129,15 +201,45 @@ static void phys_destroy_world(phys_world& w) {
     w.cell_items = 0;
 }
 
+// Drops every static collider and the grid built over them, leaving every
+// dynamic body (the player, the traffic, the crowd) exactly where it was.
+// What a live "apply and regenerate" in the map editor needs: city_generate
+// rebuilds the static side of the world from scratch, and calling it a
+// second time on top of the first would not replace the old buildings, it
+// would leave their colliders standing right where city_generate's own
+// memset just erased the geometry that used to justify them - invisible
+// walls in the middle of whatever got painted over them.
+static void phys_reset_statics(phys_world& w) {
+    free(w.cell_start);
+    free(w.cell_items);
+    w.cell_start = 0;
+    w.cell_items = 0;
+    w.cell_item_count = 0;
+    w.static_count = 0;
+}
+
 static void phys_add_static_box(phys_world& w, vec3 min, vec3 max) {
     if (w.static_count >= PHYS_MAX_STATICS) return;
-    w.statics[w.static_count++] = aabb_make(min, max);
+    size_t i = w.static_count++;
+    w.statics[i] = aabb_make(min, max);
+    w.static_shape[i].half = v2((max.x - min.x) * 0.5f, (max.z - min.z) * 0.5f);
+    w.static_shape[i].yaw = 0.0f;
+    w.static_shape[i].rotated = false;
 }
 
 static void phys_add_static_prop(phys_world& w, vec3 position, float yaw, vec2 half, float height) {
     if (w.static_count >= PHYS_MAX_STATICS) return;
     obb2 box = { v2(position.x, position.z), half, yaw };
-    w.statics[w.static_count++] = aabb_from_obb(box, position.y, height);
+    size_t i = w.static_count++;
+    w.statics[i] = aabb_from_obb(box, position.y, height);
+    w.static_shape[i].half = half;
+    w.static_shape[i].yaw = yaw;
+    // A quarter turn maps the box onto itself with its extents swapped, which
+    // aabb_from_obb has already done - so those stay on the cheaper rect path.
+    // Only genuinely diagonal props need the oriented test.
+    float turns = yaw * (2.0f / 3.14159265f);
+    float snapped = floorf(turns + 0.5f);
+    w.static_shape[i].rotated = fabsf(turns - snapped) > 0.02f;
 }
 
 static void phys_build_statics(phys_world& w) {
@@ -260,15 +362,31 @@ static void phys__resolve_statics(phys_world& w, phys_body& b) {
                 if (b.position.y >= s.max.y - 0.05f) continue;
                 if (!span_overlap(b.position.y, b.height, s.min.y, aabb_height(s))) continue;
 
-                rect2 foot = aabb_footprint(s);
+                const phys_static_shape& shape = w.static_shape[w.cell_items[k]];
                 contact2 hit;
                 bool touching;
-                if (b.shape == PHYS_BOX) {
-                    self_box.centre = v2xz(b.position);
-                    touching = collide_obb_rect(self_box, foot, &hit);
+                if (shape.rotated) {
+                    // Diagonal prop: test the footprint it really has. Its
+                    // centre is the AABB's, since aabb_from_obb bounds the box
+                    // symmetrically about it.
+                    vec3 mid = aabb_centre(s);
+                    obb2 target = { v2(mid.x, mid.z), shape.half, shape.yaw };
+                    if (b.shape == PHYS_BOX) {
+                        self_box.centre = v2xz(b.position);
+                        touching = collide_obb_obb(self_box, target, &hit);
+                    } else {
+                        self_circle.centre = v2xz(b.position);
+                        touching = collide_circle_obb(self_circle, target, &hit);
+                    }
                 } else {
-                    self_circle.centre = v2xz(b.position);
-                    touching = collide_circle_rect(self_circle, foot, &hit);
+                    rect2 foot = aabb_footprint(s);
+                    if (b.shape == PHYS_BOX) {
+                        self_box.centre = v2xz(b.position);
+                        touching = collide_obb_rect(self_box, foot, &hit);
+                    } else {
+                        self_circle.centre = v2xz(b.position);
+                        touching = collide_circle_rect(self_circle, foot, &hit);
+                    }
                 }
                 if (!touching) continue;
 
@@ -284,6 +402,20 @@ static void phys__resolve_statics(phys_world& w, phys_body& b) {
                     float j = -(1.0f + b.restitution) * vn;
                     b.velocity.x += n.x * j;
                     b.velocity.z += n.y * j;
+                    if (j > b.impact) b.impact = j;
+
+                    // Sliding along the face costs something. A body scraping
+                    // a wall with no friction keeps every bit of the speed it
+                    // had along that wall, which is how a car brushing a
+                    // building came out of the contact as fast as it went in.
+                    if (b.friction > 0.0f) {
+                        vec2 t = v2(-n.y, n.x);
+                        float vt = b.velocity.x * t.x + b.velocity.z * t.y;
+                        float cap = j * b.friction;
+                        float take = vt > cap ? cap : (vt < -cap ? -cap : vt);
+                        b.velocity.x -= t.x * take;
+                        b.velocity.z -= t.y * take;
+                    }
                 }
             }
         }
@@ -368,6 +500,26 @@ static void phys__resolve_pair(phys_body& a, phys_body& b) {
     a.velocity.z -= hit.normal.y * j * a.inv_mass;
     b.velocity.x += hit.normal.x * j * b.inv_mass;
     b.velocity.z += hit.normal.y * j * b.inv_mass;
+
+    float felt_a = -j * a.inv_mass, felt_b = -j * b.inv_mass;
+    if (felt_a > a.impact) a.impact = felt_a;
+    if (felt_b > b.impact) b.impact = felt_b;
+
+    // Tangential impulse, clamped to the Coulomb cone. This is what makes a
+    // body clipped by a car's flank get dragged along with it rather than
+    // squirting out sideways with all of its own speed intact.
+    float mu = a.friction < b.friction ? a.friction : b.friction;
+    if (mu > 0.0f) {
+        vec2 t = v2(-hit.normal.y, hit.normal.x);
+        float vt = (b.velocity.x - a.velocity.x) * t.x + (b.velocity.z - a.velocity.z) * t.y;
+        float jt = -vt / inv_sum;
+        float cap = -j * mu;                  // j is negative here; the cone is not
+        if (jt > cap) jt = cap; else if (jt < -cap) jt = -cap;
+        a.velocity.x -= t.x * jt * a.inv_mass;
+        a.velocity.z -= t.y * jt * a.inv_mass;
+        b.velocity.x += t.x * jt * b.inv_mass;
+        b.velocity.z += t.y * jt * b.inv_mass;
+    }
 }
 
 static void phys__resolve_dynamics(phys_world& w) {
@@ -392,13 +544,27 @@ static void phys__resolve_dynamics(phys_world& w) {
     }
 }
 
-static void phys_step(phys_world& w, float dt) {
-    if (dt <= 0.0f) return;
+// ---- the phases, as job bodies ----
+//
+// Each takes the world plus this step's dt as its payload and a slice of the
+// body array as its range, so the same code runs whether it is called once on
+// the calling thread or in pieces across the pool - which is what makes
+// "is a pool attached?" the only difference between the two builds.
+struct phys__phase {
+    phys_world* world;
+    float       dt;
+};
 
-    for (size_t i = 0; i < w.body_count; i++) {
+static void phys__job_integrate(void* user, size_t begin, size_t end, int) {
+    phys__phase& ph = *(phys__phase*)user;
+    phys_world& w = *ph.world;
+    float dt = ph.dt;
+
+    for (size_t i = begin; i < end; i++) {
         phys_body& b = w.bodies[i];
         if (!b.active) continue;
         b.touched = false;
+        b.impact = 0.0f;
         if (b.inv_mass == 0.0f) continue;
 
         if (b.gravity) b.velocity = v3add(b.velocity, v3scale(w.gravity, dt));
@@ -411,25 +577,50 @@ static void phys_step(phys_world& w, float dt) {
 
         b.position = v3add(b.position, v3scale(b.velocity, dt));
 
-        if (b.position.y <= w.ground_y) {
-            b.position.y = w.ground_y;
+        // Where the floor is here, which is not the same everywhere any more:
+        // the tarmac sits below the pavement it is kerbed by. Stepping *up*
+        // onto a kerb is allowed outright rather than resolved as a contact,
+        // which is the same allowance phys__resolve_statics makes for
+        // anything shorter than step_height.
+        float floor_y = w.ground_at ? w.ground_at(w.ground_user, b.position.x, b.position.z)
+                                    : w.ground_y;
+        if (b.position.y <= floor_y) {
+            b.position.y = floor_y;
             if (b.velocity.y < 0.0f) b.velocity.y = 0.0f;
             b.on_ground = true;
         } else {
             b.on_ground = false;
         }
     }
+}
+
+static void phys__job_statics(void* user, size_t begin, size_t end, int) {
+    phys__phase& ph = *(phys__phase*)user;
+    phys_world& w = *ph.world;
+    for (size_t i = begin; i < end; i++) {
+        phys_body& b = w.bodies[i];
+        if (b.active && b.inv_mass != 0.0f) phys__resolve_statics(w, b);
+    }
+}
+
+static void phys_step(phys_world& w, float dt) {
+    if (dt <= 0.0f) return;
+
+    phys__phase phase;
+    phase.world = &w;
+    phase.dt = dt;
+
+    if (w.jobs) pix_parallel_for(*w.jobs, w.body_count, phys__job_integrate, &phase, 64);
+    else        phys__job_integrate(&phase, 0, w.body_count, 0);
 
     phys__build_dynamic_grid(w);
 
     // a couple of relaxation passes: one is enough for a lone contact, two
     // stop a body squeezed between a wall and a car from being pushed through
     for (int pass = 0; pass < PHYS_SOLVER_PASSES; pass++) {
-        phys__resolve_dynamics(w);
-        for (size_t i = 0; i < w.body_count; i++) {
-            phys_body& b = w.bodies[i];
-            if (b.active && b.inv_mass != 0.0f) phys__resolve_statics(w, b);
-        }
+        phys__resolve_dynamics(w);          // writes both halves of a pair; stays serial
+        if (w.jobs) pix_parallel_for(*w.jobs, w.body_count, phys__job_statics, &phase, 32);
+        else        phys__job_statics(&phase, 0, w.body_count, 0);
     }
 }
 
@@ -528,4 +719,103 @@ static bool phys_point_blocked(const phys_world& w, vec3 position, float radius,
         }
     }
     return false;
+}
+
+
+// ---- ray against one body ----
+//
+// Both shapes are prisms: a footprint extruded between the feet and the head.
+// So each one is a 2D problem plus a height check, which is the same
+// simplification the whole solver is built on.
+static bool phys__ray_prism(vec2 o, vec2 d, float t_near, float t_far,
+                            float oy, float dy, float base, float top, float* out_t) {
+    // vertical slab first - it is one divide and it throws out the shots
+    // that pass over a car or under a bridge
+    if (dy > 1e-6f || dy < -1e-6f) {
+        float t0 = (base - oy) / dy, t1 = (top - oy) / dy;
+        if (t0 > t1) { float k = t0; t0 = t1; t1 = k; }
+        if (t0 > t_near) t_near = t0;
+        if (t1 < t_far) t_far = t1;
+    } else if (oy < base || oy > top) {
+        return false;
+    }
+    (void)o; (void)d;
+    if (t_far < t_near || t_far < 0.0f) return false;
+    *out_t = t_near > 0.0f ? t_near : 0.0f;
+    return true;
+}
+
+static bool phys__ray_body(const phys_body& b, vec3 origin, vec3 dir, float max_distance,
+                           float* out_t) {
+    vec2 o = v2(origin.x - b.position.x, origin.z - b.position.z);
+    vec2 d = v2(dir.x, dir.z);
+    float t_near, t_far;
+
+    if (b.shape == PHYS_CYLINDER) {
+        float a = d.x * d.x + d.y * d.y;
+        if (a < 1e-8f) {                       // straight up or down through the axis
+            if (o.x * o.x + o.y * o.y > b.radius * b.radius) return false;
+            t_near = 0.0f; t_far = max_distance;
+        } else {
+            float half_b = o.x * d.x + o.y * d.y;
+            float c = o.x * o.x + o.y * o.y - b.radius * b.radius;
+            float disc = half_b * half_b - a * c;
+            if (disc < 0.0f) return false;
+            float root = sqrtf(disc);
+            t_near = (-half_b - root) / a;
+            t_far  = (-half_b + root) / a;
+        }
+    } else {
+        // into the box's own frame, then a plain slab test
+        float cs = cosf(-b.yaw), sn = sinf(-b.yaw);
+        vec2 lo = v2(o.x * cs - o.y * sn, o.x * sn + o.y * cs);
+        vec2 ld = v2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        t_near = -1e30f; t_far = 1e30f;
+        const float half[2] = { b.half.x, b.half.y };
+        const float po[2] = { lo.x, lo.y };
+        const float pd[2] = { ld.x, ld.y };
+        for (int k = 0; k < 2; k++) {
+            if (pd[k] > -1e-6f && pd[k] < 1e-6f) {
+                if (po[k] < -half[k] || po[k] > half[k]) return false;
+                continue;
+            }
+            float t0 = (-half[k] - po[k]) / pd[k];
+            float t1 = ( half[k] - po[k]) / pd[k];
+            if (t0 > t1) { float sw = t0; t0 = t1; t1 = sw; }
+            if (t0 > t_near) t_near = t0;
+            if (t1 < t_far) t_far = t1;
+            if (t_far < t_near) return false;
+        }
+    }
+
+    if (t_far < 0.0f || t_near > max_distance) return false;
+    float t;
+    if (!phys__ray_prism(o, d, t_near, t_far, origin.y, dir.y,
+                         b.position.y, b.position.y + b.height, &t)) return false;
+    if (t > max_distance) return false;
+    *out_t = t;
+    return true;
+}
+
+static idx phys_raycast_bodies(const phys_world& w, vec3 origin, vec3 direction,
+                               float max_distance, uint16_t mask, idx ignore,
+                               float* out_distance) {
+    vec3 d = v3norm(direction);
+    idx best = (idx)-1;
+    float best_t = max_distance;
+
+    // A linear scan over a few hundred bodies, on purpose. Walking the hash
+    // grid along the ray would mean visiting every cell the ray crosses and
+    // re-testing whatever straddles two of them, which at this body count is
+    // more work than the scan it replaces.
+    for (size_t i = 0; i < w.body_count; i++) {
+        const phys_body& b = w.bodies[i];
+        if (!b.active || (idx)i == ignore) continue;
+        if (mask && !(b.group & mask)) continue;
+        float t;
+        if (!phys__ray_body(b, origin, d, best_t, &t)) continue;
+        if (t < best_t) { best_t = t; best = (idx)i; }
+    }
+    if (best != (idx)-1 && out_distance) *out_distance = best_t;
+    return best;
 }

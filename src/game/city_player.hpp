@@ -2,6 +2,7 @@
 #include "../core/platform.hpp"
 #include "../core/animation.hpp"
 #include "city_traffic.hpp"
+#include "city_weapons.hpp"
 
 // The player: on foot by default, behind the wheel when they get in a car.
 //
@@ -16,6 +17,23 @@
 #define CAM_FOOT_DIST    6.0f
 #define CAM_CAR_DIST     9.5f
 #define CAM_HEIGHT       1.55f
+// ---- over the shoulder ----
+//
+// Straight behind the player is the right camera for walking around and the
+// wrong one for shooting: the reticle sits in the middle of the screen and so
+// does the back of the player's head, so the one thing being aimed at is the
+// one thing that cannot be seen. Raising the gun slides the whole camera to
+// the right and pulls it in, which puts the player in the left of the frame
+// and leaves the line of the shot clear.
+//
+// The offset moves the camera and what it looks at by the same amount, so the
+// view direction does not change - the middle of the screen still points
+// exactly along city_player_aim, and the reticle still marks where a round
+// goes. Anything that moved only one of the two would leave the two
+// disagreeing, which is worse than the head being in the way.
+#define CAM_AIM_SHOULDER 0.85f    // metres to the right, aiming
+#define CAM_AIM_DIST     3.4f     // and how far back it sits instead of CAM_FOOT_DIST
+#define CAM_AIM_RISE     0.12f    // a touch of height, so the gun is not on the horizon
 
 // How the jump clip's own timeline maps onto a jump.
 //
@@ -65,8 +83,32 @@ struct city_player {
     int      car;              // index into city_traffic::cars, -1 when on foot
     float    enter_cooldown;   // stops one keypress toggling twice
 
+    // ---- punching ----
+    // The swing itself is just another clip on the same crossfaded animator
+    // every other locomotion state already uses - see the CLIP_PUNCH branch
+    // in city_player_update. `punch_landed` is what keeps one swing from
+    // registering a hit on every frame its fist happens to overlap someone;
+    // city_game.hpp's combat code claims it the moment it lands a hit.
+    bool     punching;
+    bool     punch_landed;
+
+    // ---- carrying a gun ----
+    // The state lives in city_arms (see city_weapons.hpp); what the player owns
+    // on top of it is where the thing physically is. The hand solve below runs
+    // once a frame off the pose the animator just produced, and everything
+    // downstream - the gun's own draw, the muzzle flash, where a shot starts -
+    // reads these rather than repeating it.
+    city_arms arms;
+    mat4      gun_transform;
+    bool      gun_drawn;         // true when there is a gun in the hand to draw
+
     // camera
     float cam_yaw, cam_pitch, cam_dist;
+    // 0 with the gun down, 1 with it up. What it drives is the camera swinging
+    // over the right shoulder - see city_player_camera - and it is damped
+    // rather than switched because a camera that jumps a metre sideways the
+    // frame a mouse button goes down is unreadable.
+    float cam_shoulder;
 };
 
 static void city_player_init(city_player& p, pix_data_loader& loader, const city_catalog& cat,
@@ -76,6 +118,12 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
 static void city_player_camera(const city_player& p, const phys_world& phys, camera* out);
 static void city_player_draw(const city_player& p, const city_catalog& cat, pix_renderer& renderer);
 static bool city_player_on_foot(const city_player& p) { return p.car < 0; }
+
+// True for exactly one frame per swing, at the moment the animation's fist
+// is actually extended - not the frame the key was pressed. city_game.hpp's
+// combat code calls this once a frame and, only when it comes back true,
+// scans for someone standing in front of the player to hit.
+static bool city_player_punch_frame(city_player& p);
 
 // ---------------- implementation ----------------
 
@@ -106,18 +154,42 @@ static void city_player_init(city_player& p, pix_data_loader& loader, const city
     b.gravity = true;
     p.body = phys_add_body(phys, b);
 
-    p.character = city_pick_player(cat);
+    p.character = city_pick_player(cat, loader);
     p.anim_clip = 0;
     p.anim_prev_clip = 0;
     if (p.character < cat.character_count) {
         const city_character& ch = cat.characters[p.character];
-        if (ch.ok && city_build_animator(p.anim, loader, ch.model)) {
+        if (ch.ok && city_build_character_animator(p.anim, loader, ch)) {
             p.anim_clip = ch.clips[CLIP_IDLE] != (idx)-1 ? ch.clips[CLIP_IDLE] : 0;
             p.anim_prev_clip = p.anim_clip;
             animator_play(p.anim, p.anim_clip);
             p.anim_ready = true;
         }
     }
+
+    // The hand a gun goes in. Two rigs in this cast and two conventions: the
+    // Quaternius skeletons name it Wrist.R, the Mixamo-style one RightHand.
+    // Resolved once here rather than by name every frame - it is a string
+    // compare over sixty bones, and it cannot change for the life of the rig.
+    city_arms_init(p.arms);
+    if (p.anim_ready) {
+        // Three conventions across this cast: the 62-bone Quaternius rigs
+        // call it Wrist.R, their 31-bone cousins Palm.R, and the Mixamo-style
+        // woman RightHand.
+        static const char* const HAND[] = { "Wrist.R", "Palm.R", "RightHand", "Hand.R" };
+        p.arms.hand_bone = animator_find_bone(p.anim, HAND, 4);
+    }
+}
+
+// ---- where the player is looking ----
+//
+// The camera orbits behind the player (see city_player_camera), so the way
+// they are *aiming* is the way that arm of the orbit points inward - which is
+// the one direction in this file that is neither the body's facing nor the
+// camera's own position, and is what a shot is fired along.
+static vec3 city_player_aim(const city_player& p) {
+    float cp = cosf(p.cam_pitch);
+    return v3(-sinf(p.cam_yaw) * cp, -sinf(p.cam_pitch), -cosf(p.cam_yaw) * cp);
 }
 
 // ---- getting in and out ----
@@ -276,8 +348,9 @@ static void city__update_driving(city_player& p, const pix_window& window, city_
     float throttle = 0.0f, brake = 0.0f, steer = 0.0f;
     if (window.keystates['W'].held || window.keystates[KEY_UP].held)    throttle += 1.0f;
     if (window.keystates['S'].held || window.keystates[KEY_DOWN].held)  brake += 1.0f;
-    if (window.keystates['A'].held || window.keystates[KEY_LEFT].held)  steer += 1.0f;
-    if (window.keystates['D'].held || window.keystates[KEY_RIGHT].held) steer -= 1.0f;
+    // `steer` is +1 for a right turn, so left is the negative side
+    if (window.keystates['A'].held || window.keystates[KEY_LEFT].held)  steer -= 1.0f;
+    if (window.keystates['D'].held || window.keystates[KEY_RIGHT].held) steer += 1.0f;
     if (pad.connected) {
         throttle += pad.right_trigger;
         brake += pad.left_trigger;
@@ -324,13 +397,22 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
     }
     p.cam_pitch = clampf(p.cam_pitch, -0.35f, 1.15f);
 
+    // The gun being up is what asks for the shoulder camera, and it stays
+    // asked for through the recoil and the follow-through of a shot rather
+    // than dropping back the instant the trigger is released.
+    bool over_shoulder = city_player_on_foot(p) && (p.arms.aiming || p.arms.shoot > 0.0f);
+    p.cam_shoulder = damp(p.cam_shoulder, over_shoulder ? 1.0f : 0.0f, 8.0f, dt);
+
     float want_dist = city_player_on_foot(p) ? CAM_FOOT_DIST : CAM_CAR_DIST;
+    if (city_player_on_foot(p))
+        want_dist = CAM_FOOT_DIST + (CAM_AIM_DIST - CAM_FOOT_DIST) * p.cam_shoulder;
     p.cam_dist = damp(p.cam_dist, want_dist, 5.0f, dt);
 
     // ---- get in / get out ----
+    // 'E' is the house door interact (see city_house.hpp) - kept off this one
+    // so a press near both a car and a doorway cannot fire both at once.
     if (p.enter_cooldown > 0.0f) p.enter_cooldown -= dt;
-    bool interact = window.keystates['F'].pressed || window.keystates['E'].pressed
-                 || pad.buttons[PAD_Y].pressed;
+    bool interact = window.keystates['F'].pressed || pad.buttons[PAD_Y].pressed;
     if (interact && p.enter_cooldown <= 0.0f) {
         p.enter_cooldown = 0.35f;
         if (city_player_on_foot(p)) {
@@ -341,8 +423,67 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
         }
     }
 
+    // ---- the gun ----
+    //
+    // The recoil the tick hands back is added to the camera's pitch rather
+    // than played as an animation over it: firing pushed the real aim up, and
+    // this is the same number walking the real aim back down. What that buys
+    // is that a burst that climbs is genuinely harder to keep on target, not
+    // decorated to look like it.
+    p.cam_pitch += city_arms_tick(p.arms, cat, dt);
+    p.cam_pitch = clampf(p.cam_pitch, -0.35f, 1.15f);
+
+    bool armed = city_player_on_foot(p) && city_arms_current(p.arms, cat) != 0;
+    if (!city_player_on_foot(p)) { p.arms.aiming = false; p.arms.reload = 0.0f; }
+
+    if (city_player_on_foot(p)) {
+        if (window.keystates['Q'].pressed || pad.buttons[PAD_DPAD_UP].pressed)
+            city_arms_next(p.arms, cat);
+        // and straight to a numbered slot, for anyone who would rather not
+        // cycle past two guns to reach the third
+        for (int k = 0; k < WEAPON_COUNT; k++)
+            if (window.keystates['1' + k].pressed && p.arms.owned[k]) {
+                p.arms.weapon = k;
+                p.arms.reload = 0.0f;
+            }
+        if (window.keystates['R'].pressed || pad.buttons[PAD_B].pressed)
+            city_arms_start_reload(p.arms, cat);
+    }
+
+    // Aiming is held, not toggled: it is a stance, and a stance you have to
+    // remember you are in is a stance you keep firing out of by accident.
+    p.arms.aiming = armed && !p.punching
+                 && (window.keystates[MOUSE_BUTTON_RIGHT].held
+                     || pad.left_trigger > 0.5f);
+
+    // ---- punching ----
+    // On foot only, one swing at a time - a second click partway through the
+    // first is ignored rather than restarting the clip, which is what stops
+    // a fast clicker looking like they never actually threw the punch.
+    // A gun in the hand takes the same button over entirely: swinging a fist
+    // while holding a rifle is not a choice anyone would make on purpose.
+    bool trigger_pressed = window.keystates[MOUSE_BUTTON_LEFT].pressed
+                        || pad.buttons[PAD_RIGHT_BUMPER].pressed;
+    bool trigger_held = window.keystates[MOUSE_BUTTON_LEFT].held
+                     || pad.buttons[PAD_RIGHT_BUMPER].held
+                     || pad.right_trigger > 0.5f;
+    bool want_punch = !armed && (trigger_pressed || pad.buttons[PAD_X].pressed);
+    if (want_punch && city_player_on_foot(p) && !p.punching
+        && p.character < cat.character_count
+        && cat.characters[p.character].clips[CLIP_PUNCH] != (idx)-1) {
+        p.punching = true;
+        p.punch_landed = false;
+    }
+
     if (city_player_on_foot(p)) city__update_on_foot(p, window, phys, dt);
     else                        city__update_driving(p, window, traffic, cat, phys, dt);
+
+    // Aiming turns the body to face the shot, whatever direction the feet
+    // happen to be carrying it. Letting the aim and the body disagree is what
+    // makes third person shooting read as a floating reticle rather than as a
+    // person pointing something at something.
+    if (p.arms.aiming || p.arms.shoot > 0.0f)
+        p.yaw = damp_angle(p.yaw, p.cam_yaw, 16.0f, dt);
 
     // ---- animation ----
     // A clip per locomotion state rather than one cycle stretched over all of
@@ -358,6 +499,22 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
 
         if (!city_player_on_foot(p)) {
             want = ch.clips[CLIP_SIT];                      // behind the wheel
+        } else if (p.punching && ch.clips[CLIP_PUNCH] != (idx)-1) {
+            want = ch.clips[CLIP_PUNCH];
+        // Armed changes what standing still and what running look like, and
+        // nothing else: the walk is still the walk, because the gun is
+        // attached to the hand rather than baked into the clip, and a rig
+        // with no firearm poses at all falls through GUN_IDLE to its ordinary
+        // idle (see CLIP_FALLBACK) and simply carries the thing.
+        } else if (armed && (p.arms.aiming || p.arms.shoot > 0.0f)
+                   && !p.airborne && p.land_time <= 0.0f) {
+            want = p.arms.shoot > 0.0f ? ch.clips[CLIP_GUN_SHOOT] : ch.clips[CLIP_GUN_AIM];
+        } else if (armed && p.speed > PLAYER_WALK_SPEED * 1.35f
+                   && !p.airborne && p.land_time <= 0.0f) {
+            want = ch.clips[CLIP_GUN_RUN];
+            rate = clampf(p.speed / PLAYER_RUN_SPEED, 0.65f, 1.55f);
+        } else if (armed && p.speed <= 0.3f && !p.airborne && p.land_time <= 0.0f) {
+            want = ch.clips[CLIP_GUN_IDLE];
         } else if ((p.airborne || p.land_time > 0.0f) && ch.clips[CLIP_JUMP] != (idx)-1) {
             want = ch.clips[CLIP_JUMP];
             jumping = true;
@@ -399,6 +556,13 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
             p.anim_time += dt * rate;
         }
 
+        // The swing ends when its own clip does, not on a timer kept
+        // separately - so a rig with a snappier punch throws faster punches.
+        if (p.punching && p.anim_clip == ch.clips[CLIP_PUNCH]
+            && p.anim_time >= animator_duration(p.anim, p.anim_clip)) {
+            p.punching = false;
+        }
+
         if (p.anim_fade > 0.0f) {
             p.anim_prev_time += dt;
             p.anim_fade -= dt / ANIM_FADE_TIME;
@@ -410,6 +574,88 @@ static void city_player_update(city_player& p, const pix_window& window, city_tr
         animator_sample_blend(p.anim, p.anim_prev_clip, p.anim_prev_time,
                               p.anim_clip, p.anim_time, 1.0f - p.anim_fade, &p.anim.pose);
     }
+
+    // ---- putting the gun in the hand ----
+    //
+    // This runs after the pose because it reads it. The wrist's transform is
+    // taken in world space, its axes are renormalised (the rigs carry a
+    // hundredfold scale on their bones), and the gun's own frame is built
+    // straight out of them rather than by multiplying a correction matrix
+    // through: the barrel goes along the wrist's Y, the sights along its -X,
+    // which is the arrangement every rig in this cast shares and the one
+    // thing about a hand a bone name cannot tell you.
+    p.gun_drawn = false;
+    p.arms.muzzle_valid = false;
+    const city_weapon* held = city_arms_current(p.arms, cat);
+    if (held && p.anim_ready && p.arms.hand_bone >= 0 && city_player_on_foot(p)
+        && p.character < cat.character_count) {
+        const city_character& ch = cat.characters[p.character];
+        const city_model* gun = city_get(cat, held->model);
+        if (gun) {
+            mat4 model = mat4_trs_y(p.position, p.yaw + ch.yaw_offset, ch.scale);
+            mat4 hand = mat4_mul(model, animation_bone_world(p.anim, p.anim.pose,
+                                                            p.arms.hand_bone));
+            vec3 bx = v3norm(v3(hand.data[0], hand.data[1], hand.data[2]));
+            vec3 by = v3norm(v3(hand.data[4], hand.data[5], hand.data[6]));
+            vec3 bz = v3norm(v3(hand.data[8], hand.data[9], hand.data[10]));
+
+            vec3 forward = by;                       // down the barrel
+            vec3 up = v3scale(bx, -1.0f);            // out of the sights
+            vec3 side = bz;
+            vec3 wrist = v3(hand.data[12], hand.data[13], hand.data[14]);
+            vec3 origin = v3add(wrist,
+                v3add(v3scale(forward, held->grip.x),
+                      v3add(v3scale(up, held->grip.y), v3scale(side, held->grip.z))));
+
+            float k = gun->scale;
+            mat4 m = mat4_identity();
+            m.data[0] = forward.x * k; m.data[1] = forward.y * k; m.data[2] = forward.z * k;
+            m.data[4] = up.x * k;      m.data[5] = up.y * k;      m.data[6] = up.z * k;
+            m.data[8] = side.x * k;    m.data[9] = side.y * k;    m.data[10] = side.z * k;
+            m.data[12] = origin.x;     m.data[13] = origin.y;     m.data[14] = origin.z;
+            p.gun_transform = m;
+            p.gun_drawn = true;
+
+            p.arms.muzzle = v3add(origin, v3scale(forward, held->muzzle));
+            p.arms.muzzle_dir = forward;
+            p.arms.muzzle_right = side;
+            p.arms.muzzle_valid = true;
+        }
+    }
+
+    // ---- the trigger ----
+    //
+    // Only the decision is made here. What a round does to the world needs the
+    // crowd, the traffic and the particle pool, none of which the player knows
+    // about, so this raises `fired` for one frame exactly the way a pedestrian
+    // raises `struck` and city_game.hpp resolves it - see city__player_shoot.
+    if (armed && p.gun_drawn
+        && city_arms_wants_shot(p.arms, cat, trigger_pressed, trigger_held)) {
+        if (p.arms.magazine[p.arms.weapon] > 0) {
+            p.arms.trigger = true;
+        } else if (p.arms.dry_click <= 0.0f) {
+            // Empty. One click, then a reload starts on its own - hunting for
+            // the reload key while somebody shoots back is not tension.
+            p.arms.dry_click = 0.35f;
+            p.arms.clicked = true;
+            city_arms_start_reload(p.arms, cat);
+        }
+    }
+}
+
+// Just under halfway through the swing is roughly where these rigs' fists
+// are actually extended rather than still winding up or already pulling
+// back - close enough without hand-tuning it per rig, since every clip
+// scales its own frame timing into a fixed 0..1 span underneath this.
+#define PUNCH_IMPACT_FRACTION 0.42f
+
+static bool city_player_punch_frame(city_player& p) {
+    if (!p.punching || p.punch_landed) return false;
+    float duration = animator_duration(p.anim, p.anim_clip);
+    if (duration <= 0.0f) duration = 0.4f;
+    if (p.anim_time < duration * PUNCH_IMPACT_FRACTION) return false;
+    p.punch_landed = true;
+    return true;
 }
 
 // The camera sits behind the target on a spring arm, pulled in whenever a wall
@@ -419,6 +665,15 @@ static void city_player_camera(const city_player& p, const phys_world& phys, cam
 
     float cp = cosf(p.cam_pitch);
     vec3 back = v3(sinf(p.cam_yaw) * cp, sinf(p.cam_pitch), cosf(p.cam_yaw) * cp);
+
+    // Over the shoulder, if the gun is up. Applied to the point being looked
+    // at, so the camera behind it inherits the same shift and the direction
+    // between them is untouched - see the CAM_AIM_ notes.
+    if (p.cam_shoulder > 0.001f) {
+        vec3 right = dir_right(v3norm(v3(-back.x, 0.0f, -back.z)));
+        target = v3add(target, v3scale(right, CAM_AIM_SHOULDER * p.cam_shoulder));
+        target.y += CAM_AIM_RISE * p.cam_shoulder;
+    }
 
     float dist = p.cam_dist;
     float hit;
@@ -446,4 +701,18 @@ static void city_player_draw(const city_player& p, const city_catalog& cat,
     inst.material = ch.materials[0];
     inst.transform = mat4_trs_y(p.position, p.yaw + ch.yaw_offset, ch.scale);
     push_animated_instance(renderer, inst, p.anim.pose);
+
+    // The gun rides on the hand solve from this frame's update, so it is an
+    // ordinary rigid instance rather than anything skinned - which is also
+    // why it costs nothing and needs no second rig.
+    if (p.gun_drawn) {
+        const city_weapon* held = city_arms_current(p.arms, cat);
+        const city_model* gun = held ? city_get(cat, held->model) : 0;
+        if (gun) {
+            push_instance(renderer, gun->mesh, gun->material, p.gun_transform);
+            for (int part = 0; part < gun->part_count; part++)
+                push_instance(renderer, gun->part_mesh[part], gun->part_material[part],
+                              p.gun_transform);
+        }
+    }
 }

@@ -2,6 +2,36 @@
 #include <math.h>
 #include "dtype.hpp"
 
+// ---- SSE, where the compiler offers it ----
+//
+// Only one thing in this file is worth hand-vectorising, and it is
+// mat4_mul: a character rig is sixty-odd bones deep in matrix products, a
+// frame poses a crowd of them, and the scalar version is sixty-four scalar
+// multiplies where SSE does the same work in sixteen. Everything else here is
+// three or four floats at a time, where the shuffling costs more than it
+// saves - a vec3 in four lanes wastes a quarter of every instruction and the
+// compiler's own auto-vectorisation already does better with the plain code.
+//
+// Loads are unaligned on purpose. A mat4 is a bare float[16] that lives inside
+// larger structs, in arrays, and in the middle of vertex buffers, so nothing
+// guarantees it is on a sixteen-byte boundary; on anything since Nehalem an
+// unaligned load off an aligned address costs nothing, and off an unaligned
+// one it is the only thing that works at all.
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+  #if defined(__has_include)
+    #if __has_include(<immintrin.h>)
+      #include <immintrin.h>
+      #define PIX_MATH_SSE 1
+    #endif
+  #else
+    #include <immintrin.h>
+    #define PIX_MATH_SSE 1
+  #endif
+#endif
+#ifndef PIX_MATH_SSE
+  #define PIX_MATH_SSE 0
+#endif
+
 static vec3 v3(float x, float y, float z) { vec3 r = { x, y, z }; return r; }
 static vec3 v3add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
 static vec3 v3sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
@@ -73,6 +103,31 @@ static mat4 mat4_identity() {
 }
 
 // r = a * b  (column-major, index = col*4 + row)
+//
+// Column-major is what makes the SSE form so direct: a column of the result is
+// a linear combination of a's four columns, weighted by the four scalars in
+// the matching column of b. So each output column is four broadcasts and four
+// multiply-adds over whole columns, with no transposing and no horizontal adds
+// - the shape the scalar loop below spells out one element at a time.
+#if PIX_MATH_SSE
+static mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    __m128 a0 = _mm_loadu_ps(a.data + 0);
+    __m128 a1 = _mm_loadu_ps(a.data + 4);
+    __m128 a2 = _mm_loadu_ps(a.data + 8);
+    __m128 a3 = _mm_loadu_ps(a.data + 12);
+
+    for (int c = 0; c < 4; c++) {
+        __m128 bc = _mm_loadu_ps(b.data + c * 4);
+        __m128 out =                _mm_mul_ps(a0, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(0, 0, 0, 0)));
+        out = _mm_add_ps(out,       _mm_mul_ps(a1, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(1, 1, 1, 1))));
+        out = _mm_add_ps(out,       _mm_mul_ps(a2, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(2, 2, 2, 2))));
+        out = _mm_add_ps(out,       _mm_mul_ps(a3, _mm_shuffle_ps(bc, bc, _MM_SHUFFLE(3, 3, 3, 3))));
+        _mm_storeu_ps(r.data + c * 4, out);
+    }
+    return r;
+}
+#else
 static mat4 mat4_mul(mat4 a, mat4 b) {
     mat4 r = {};
     for (int c = 0; c < 4; c++)
@@ -83,6 +138,7 @@ static mat4 mat4_mul(mat4 a, mat4 b) {
         }
     return r;
 }
+#endif
 
 static mat4 mat4_translate(float x, float y, float z) {
     mat4 m = mat4_identity();
@@ -240,6 +296,26 @@ static mat4 mat4_trs_y(vec3 position, float yaw, float scale) {
 static mat4 mat4_trs_y2(vec3 position, float yaw, float scale_xz, float scale_y) {
     mat4 m = mat4_trs_y(position, yaw, scale_xz);
     m.data[5] = scale_y;
+    return m;
+}
+
+// same again, with all three axes independent.
+//
+// What this is for is street frontage. A building model is whatever depth its
+// author gave it, and scaling it to fill its lot uniformly means the shallow
+// ones come out narrow: a terrace built from them has a stripe of pavement
+// showing between every pair of neighbours, which is the one thing a terrace
+// must not have. Widening along the building own X - which is across the
+// facade for every model in this set - closes those gaps without making the
+// building any deeper into the block behind it.
+static mat4 mat4_trs_y3(vec3 position, float yaw, float scale_x, float scale_y, float scale_z) {
+    mat4 m = {};
+    float c = cosf(yaw), s = sinf(yaw);
+    m.data[0] = c * scale_x;  m.data[2]  = -s * scale_x;
+    m.data[5] = scale_y;
+    m.data[8] = s * scale_z;  m.data[10] = c * scale_z;
+    m.data[12] = position.x; m.data[13] = position.y; m.data[14] = position.z;
+    m.data[15] = 1.0f;
     return m;
 }
 

@@ -29,6 +29,12 @@ struct pix_key_state {
 // code never collides with an ascii letter
 #define KEY_LEFT_BRACKET  207
 #define KEY_RIGHT_BRACKET 208
+// function keys land on their own VK codes already (see pix__map_vk's
+// passthrough), these just name the two this project actually binds
+#define KEY_F5 0x74
+#define KEY_F6 0x75
+#define KEY_F12 0x7B
+#define KEY_RETURN 0x0D
 // these keep their windows virtual key codes, which pix__map_vk passes through
 #define KEY_SHIFT 16
 #define KEY_CTRL  17
@@ -76,6 +82,7 @@ struct pix_window {
     pix_key_state keystates[256];   // ascii-indexed; mouse buttons + special keys use the codes above
     int mouse_x;      int mouse_y;
     int mouse_rel_x;  int mouse_rel_y;
+    int mouse_wheel;                 // notches this frame, +1 per detent forward; see WM_MOUSEWHEEL
     bool mouse_captured;            // cursor hidden and re-centred every frame
     bool should_close;
 
@@ -111,6 +118,7 @@ static void pix_stop_gamepad_rumble(pix_window& window);   // all pads, e.g. on 
 
 typedef HGLRC(WINAPI* PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int*);
 typedef BOOL (WINAPI* PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int*, const FLOAT*, UINT, int*, UINT*);
+typedef BOOL (WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int);
 
 
 // -------------------- implementation --------------------
@@ -318,6 +326,10 @@ static LRESULT CALLBACK pix__wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MBUTTONDOWN: pix__key_down(w, MOUSE_BUTTON_MID);   return 0;
         case WM_MBUTTONUP:   pix__key_up  (w, MOUSE_BUTTON_MID);   return 0;
 
+        case WM_MOUSEWHEEL:
+            w->mouse_wheel += GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            return 0;
+
         case WM_MOUSEMOVE: {
             int nx = GET_X_LPARAM(lp);
             int ny = GET_Y_LPARAM(lp);
@@ -402,6 +414,15 @@ static pix_window pix_create_window(const char* title, int width, int height) {
     win.gl_context = rc;
     wglMakeCurrent(win.dc, rc);
 
+    // The driver's default is vsync on, which silently caps the frame rate at
+    // the monitor's refresh - a scene that would otherwise run at 150fps reads
+    // as a flat 60 and looks exactly like a real bottleneck. Uncapped here so
+    // the number on screen is what the engine actually costs; a compositor
+    // still won't tear a normal window, so there is no real downside.
+    PFNWGLSWAPINTERVALEXTPROC wglSwapIntervalEXT =
+        (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
+    if (wglSwapIntervalEXT) wglSwapIntervalEXT(0);
+
     ShowWindow(win.handle, SW_SHOW);
 
     pix__load_xinput();   // absent xinput just means no pads are ever reported
@@ -431,6 +452,7 @@ static void pix_update_window(pix_window& window) {
     }
     window.mouse_rel_x = 0;
     window.mouse_rel_y = 0;
+    window.mouse_wheel = 0;
 
     pix__active = &window;
     MSG msg;

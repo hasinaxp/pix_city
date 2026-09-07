@@ -43,6 +43,13 @@
 // against CAR_BRAKE needs 6.7 m, and the rest is the gap it keeps once stopped.
 #define CAR_LOOKAHEAD     14.0f
 #define CAR_GAP            2.2f    // bumper to bumper, stationary
+
+// ---- driver manner, not vehicle capability ----
+#define CAR_HORN_PATIENCE   1.6f   // seconds held up before an average driver sounds off
+#define CAR_HORN_COOLDOWN   3.2f   // and how long before they would do it again
+#define CAR_EMERGENCY_SPEED 4.0f   // below this, hard braking is just stopping
+#define CAR_SWERVE_LOOKAHEAD 9.0f
+#define CAR_SWERVE_MAX      0.85f  // metres; a nudge across the lane, not an overtake
 #define CAR_CLAIM_NONE   0xFFFFu
 
 struct city_car {
@@ -62,6 +69,21 @@ struct city_car {
     int     claim_x, claim_z;  // junction cell reserved for this car, -1 if none
     float   blocked_time;   // how long it has been unable to move
     float   brake_light;    // 0..1, for anything that wants to show it
+
+    // ---- how a driver behaves about being held up ----
+    //
+    // A car that simply stops for whatever is in front of it is traffic; a car
+    // that leans on the horn at somebody standing in the road, stands on the
+    // brakes when they step out, and eases around a stalled one is a driver.
+    // These carry that between the AI and whatever wants to hear it - the
+    // sounds are played by city_game.hpp, which is the only thing that knows
+    // where the listener is.
+    float   held_up;        // seconds spent stopped by something that is not a red light
+    float   horn_cooldown;  // seconds until this driver would sound off again
+    bool    honking;        // set for the one frame the horn is struck
+    bool    skidding;       // set for the one frame an emergency stop begins
+    float   swerve;         // metres of lateral offset being held around an obstacle
+    float   temper;         // 0..1, how quickly this driver reaches for the horn
 };
 
 struct city_traffic {
@@ -216,6 +238,10 @@ static int city_traffic_spawn(city_traffic& t, const city_world& w, const city_c
                        v3scale(dir_right(travel), ROAD_LANE_OFFSET));
     c.yaw = yaw_from_forward(travel);
     c.speed = rng_range(t.random, 5.0f, 10.0f);
+    // Some drivers lean on the horn the moment they are held up and some
+    // never touch it. Rolled once, so a given car behaves the same way for
+    // as long as it is on the road.
+    c.temper = (rng_range(t.random, 0.0f, 1.0f) + rng_range(t.random, 0.0f, 1.0f)) * 0.5f;
     c.active = true;
 
     const city_vehicle_model& vm = cat.vehicles[c.model];
@@ -256,10 +282,17 @@ static void city__despawn(city_traffic& t, phys_world& phys, city_car& c) {
 // angle, and a cone aimed down the old heading looks straight at the kerb while
 // the car it is about to run into sits outside it - which is exactly how a
 // queue of turning cars used to end up shunting each other round a corner.
+// `out_is_person` says whether the nearest thing in the way is somebody on
+// foot rather than another car, and `out_side` which side of the bonnet they
+// are on (negative left, positive right). A driver treats the two completely
+// differently: you wait behind a car and you sound the horn at a person.
 static float city__clear_ahead(const phys_world& phys, const city_car& self,
-                               const city_vehicle_model& vm, vec3 heading) {
+                               const city_vehicle_model& vm, vec3 heading,
+                               bool* out_is_person, float* out_side) {
     float reach = vm.half_length + CAR_LOOKAHEAD;
     float nearest = reach;
+    if (out_is_person) *out_is_person = false;
+    if (out_side) *out_side = 0.0f;
 
     idx hits[64];
     size_t n = phys_query_neighbours(phys, self.position, reach + 2.0f, hits, 64);
@@ -275,11 +308,16 @@ static float city__clear_ahead(const phys_world& phys, const city_car& self,
         // Lateral gap, widened by the other body's own footprint - and widened
         // again with distance, so a car far enough ahead to still be swinging
         // through a bend is not missed by a cone that only looks straight.
-        float side = fabsf(to.x * heading.z - to.z * heading.x);
+        float signed_side = to.x * heading.z - to.z * heading.x;
+        float side = fabsf(signed_side);
         float clearance = vm.half_width + (b.shape == PHYS_BOX ? b.half.x : b.radius)
                         + 0.25f + along * 0.16f;
         if (side > clearance) continue;
-        if (along < nearest) nearest = along;
+        if (along < nearest) {
+            nearest = along;
+            if (out_is_person) *out_is_person = (b.group & (PHYS_LAYER_PED | PHYS_LAYER_PLAYER)) != 0;
+            if (out_side) *out_side = signed_side;
+        }
     }
     return nearest - vm.half_length;
 }
@@ -309,6 +347,15 @@ static void city__drive_ai(city_traffic& t, city_car& c, int self, city_world& w
     }
 
     target = city__pursuit_point(w, c, distance);
+    // Whatever the driver decided last frame about easing around an obstacle
+    // is applied here, as an offset on the point being steered at rather than
+    // as a bias on the steering itself - a car that aims a lane-width to the
+    // left still tracks the road, where one with a thumb on the wheel drifts.
+    if (fabsf(c.swerve) > 0.01f) {
+        vec3 fwd = forward_from_yaw(c.yaw);
+        target.x += -fwd.z * c.swerve;
+        target.z +=  fwd.x * c.swerve;
+    }
     to_target = v3sub(target, c.position);
     to_target.y = 0.0f;
     distance = v3len(to_target);
@@ -361,7 +408,10 @@ static void city__drive_ai(city_traffic& t, city_car& c, int self, city_world& w
     // whatever is in front, measured along the way the car is going
     vec3 heading = distance > 1e-3f ? v3scale(to_target, 1.0f / distance)
                                     : forward_from_yaw(c.yaw);
-    float clear = city__clear_ahead(phys, c, vm, heading);
+    bool blocker_is_person = false;
+    float blocker_side = 0.0f;
+    float clear = city__clear_ahead(phys, c, vm, heading, &blocker_is_person, &blocker_side);
+    float speed_before = c.speed;
     if (clear < CAR_LOOKAHEAD) {
         // Stop with CAR_GAP still in hand, and approach that gap at a speed the
         // brakes can actually shed - sqrt(2 a d) is the exact answer, and using
@@ -376,6 +426,42 @@ static void city__drive_ai(city_traffic& t, city_car& c, int self, city_world& w
     c.speed += clampf(target_speed - c.speed, -CAR_BRAKE * dt, accel * dt);
     if (c.speed < 0.0f) c.speed = 0.0f;
     c.brake_light = target_speed < c.speed - 0.5f ? 1.0f : 0.0f;
+
+    // ---- the driver, as opposed to the car ----
+    c.honking = false;
+    c.skidding = false;
+    if (c.horn_cooldown > 0.0f) c.horn_cooldown -= dt;
+
+    // Shedding more than about two thirds of full braking in one step is not
+    // slowing down, it is standing on the pedal - somebody stepped out.
+    if (speed_before - c.speed > CAR_BRAKE * 0.62f * dt && speed_before > CAR_EMERGENCY_SPEED) {
+        c.skidding = true;
+        c.brake_light = 1.0f;
+    }
+
+    // Held up by something that is not a red light. A queue at a junction is
+    // traffic and nobody's fault; a person standing in the carriageway is
+    // somebody's fault, and impatient drivers say so sooner.
+    bool obstructed = clear < CAR_LOOKAHEAD && c.speed < 1.2f;
+    if (obstructed && !must_stop) c.held_up += dt;
+    else if (!obstructed) c.held_up = 0.0f;
+
+    float patience = CAR_HORN_PATIENCE * (1.35f - c.temper);
+    if (blocker_is_person) patience *= 0.4f;     // far less tolerance for a jaywalker
+    if (c.held_up > patience && c.horn_cooldown <= 0.0f) {
+        c.honking = true;
+        c.horn_cooldown = CAR_HORN_COOLDOWN * (1.6f - c.temper);
+        c.held_up = 0.0f;
+    }
+
+    // Easing around rather than sitting behind. Only worth doing for something
+    // already off to one side - a car square in the lane is a queue to wait in,
+    // not an obstacle to squeeze past - and only ever by a fraction of a lane,
+    // so this reads as giving way rather than as overtaking into oncoming.
+    float want_swerve = 0.0f;
+    if (clear < CAR_SWERVE_LOOKAHEAD && clear > 0.5f && fabsf(blocker_side) > 0.35f)
+        want_swerve = (blocker_side > 0.0f ? -1.0f : 1.0f) * CAR_SWERVE_MAX;
+    c.swerve = damp(c.swerve, want_swerve, 2.6f, dt);
 
     // A car wedged against geometry gives up and is recycled elsewhere rather
     // than sitting in the world forever blocking the lane behind it. Waiting at

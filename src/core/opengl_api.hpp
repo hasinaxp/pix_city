@@ -4,6 +4,7 @@
 
 // ---- types missing from the OS <GL/gl.h> (OpenGL 1.1) ----
 typedef char      GLchar;
+typedef unsigned long long GLuint64;
 typedef ptrdiff_t GLsizeiptr;
 typedef ptrdiff_t GLintptr;
 
@@ -16,6 +17,8 @@ typedef ptrdiff_t GLintptr;
 #define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_STATIC_DRAW          0x88E4
 #define GL_DYNAMIC_DRAW         0x88E8
+#define GL_STREAM_DRAW          0x88E0
+#define GL_UNIFORM_BUFFER       0x8A11
 #define GL_TEXTURE0             0x84C0
 #define GL_CLAMP_TO_EDGE        0x812F
 #define GL_CLAMP_TO_BORDER      0x812D
@@ -33,6 +36,9 @@ typedef ptrdiff_t GLintptr;
 #define GL_DEPTH_COMPONENT24    0x81A6
 #define GL_DEPTH_COMPONENT32F   0x8CAC
 #define GL_RGBA16F              0x881A
+#define GL_TIME_ELAPSED         0x88BF
+#define GL_QUERY_RESULT         0x8866
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
 #define GL_RGB16F               0x881B
 #define GL_HALF_FLOAT           0x140B
 #define GL_TEXTURE_COMPARE_MODE 0x884C
@@ -66,6 +72,7 @@ typedef void  (APIENTRY* PFN_glEnableVertexAttribArray)(GLuint);
 typedef void  (APIENTRY* PFN_glVertexAttribDivisor)(GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstanced)(GLenum, GLsizei, GLenum, const void*, GLsizei);
 typedef void  (APIENTRY* PFN_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
+typedef void  (APIENTRY* PFN_glBindBufferBase)(GLenum, GLuint, GLuint);
 typedef void  (APIENTRY* PFN_glDrawElementsInstancedBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint);
 typedef void  (APIENTRY* PFN_glActiveTexture)(GLenum);
 typedef void  (APIENTRY* PFN_glGenerateMipmap)(GLenum);
@@ -92,13 +99,26 @@ typedef void  (APIENTRY* PFN_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, 
 typedef void  (APIENTRY* PFN_glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
 typedef void  (APIENTRY* PFN_glDeleteBuffers)(GLsizei, const GLuint*);
 typedef void  (APIENTRY* PFN_glDeleteVertexArrays)(GLsizei, const GLuint*);
+// Draws a run of instances starting part way into the instance buffer, which
+// is what lets a whole frame's transforms go up in one upload instead of one
+// per batch - see pix__instance_upload.
+typedef void  (APIENTRY* PFN_glDrawElementsInstancedBaseVertexBaseInstance)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
+// timer queries: GL_TIME_ELAPSED around a pass is the only way to find out
+// what the GPU actually spent on it - every draw call returns long before the
+// work does, so nothing measured on the CPU can tell one pass from another
+typedef void  (APIENTRY* PFN_glGenQueries)(GLsizei, GLuint*);
+typedef void  (APIENTRY* PFN_glDeleteQueries)(GLsizei, const GLuint*);
+typedef void  (APIENTRY* PFN_glBeginQuery)(GLenum, GLuint);
+typedef void  (APIENTRY* PFN_glEndQuery)(GLenum);
+typedef void  (APIENTRY* PFN_glGetQueryObjectiv)(GLuint, GLenum, GLint*);
+typedef void  (APIENTRY* PFN_glGetQueryObjectui64v)(GLuint, GLenum, GLuint64*);
 
 #define GL_FUNC_LIST \
     E(glCreateShader) E(glShaderSource) E(glCompileShader) E(glGetShaderiv) \
     E(glGetShaderInfoLog) E(glCreateProgram) E(glAttachShader) E(glLinkProgram) \
     E(glGetProgramiv) E(glGetProgramInfoLog) E(glDeleteShader) E(glUseProgram) \
     E(glGenVertexArrays) E(glBindVertexArray) E(glGenBuffers) E(glBindBuffer) \
-    E(glBufferData) E(glBufferSubData) E(glVertexAttribPointer) E(glVertexAttribIPointer) E(glEnableVertexAttribArray) \
+    E(glBufferData) E(glBufferSubData) E(glBindBufferBase) E(glVertexAttribPointer) E(glVertexAttribIPointer) E(glEnableVertexAttribArray) \
     E(glVertexAttribDivisor) E(glDrawElementsInstanced) E(glDrawElementsInstancedBaseVertex) \
     E(glDrawArraysInstanced) \
     E(glActiveTexture) E(glGenerateMipmap) E(glGetUniformLocation) \
@@ -107,7 +127,10 @@ typedef void  (APIENTRY* PFN_glDeleteVertexArrays)(GLsizei, const GLuint*);
     E(glGenFramebuffers) E(glBindFramebuffer) E(glDeleteFramebuffers) E(glFramebufferTexture2D) \
     E(glCheckFramebufferStatus) E(glGenRenderbuffers) E(glBindRenderbuffer) \
     E(glDeleteRenderbuffers) E(glRenderbufferStorage) E(glFramebufferRenderbuffer) \
-    E(glBlitFramebuffer) E(glDeleteBuffers) E(glDeleteVertexArrays)
+    E(glBlitFramebuffer) E(glDeleteBuffers) E(glDeleteVertexArrays) \
+    E(glDrawElementsInstancedBaseVertexBaseInstance) \
+    E(glGenQueries) E(glDeleteQueries) E(glBeginQuery) E(glEndQuery) \
+    E(glGetQueryObjectiv) E(glGetQueryObjectui64v)
 
 #define E(name) static PFN_##name name;
 GL_FUNC_LIST

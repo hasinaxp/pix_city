@@ -38,8 +38,11 @@
 // of a kit tile lying on a lawn.
 #define ROAD_Y           (-0.10f * KIT_ROAD_SCALE)   // where a road tile's origin goes
 #define ROAD_SURFACE_Y   (-0.03f * KIT_ROAD_SCALE)   // the tarmac itself, 12 cm down
-#define ROAD_HALF_WIDTH  (CITY_TILE * 0.45f)
-#define ROAD_LANE_OFFSET (CITY_TILE * 0.22f)         // lane centre, right of the centreline
+// The carriageway is a whole cell wide less its kerbs, and the lanes sit
+// wider apart in it than they did - with the footpath pulled back, oncoming
+// traffic can use the road it is actually driving on.
+#define ROAD_HALF_WIDTH  (CITY_TILE * 0.47f)
+#define ROAD_LANE_OFFSET (CITY_TILE * 0.25f)         // lane centre, right of the centreline
 
 // A pavement cell is a whole tile across, but a whole tile of pavement either
 // side of the road is nothing like a street: 8 m of footpath flanking 8 m of
@@ -56,10 +59,16 @@
 // room to walk despite being full of obstacles. Everything from there back to
 // the facade is the walking strip, and nothing static is ever put in it.
 //
-//   facade | 2.5 m walking strip | 1.5 m furniture | kerb | carriageway
-#define SIDEWALK_WIDTH   4.0f                              // kerb to facade
+//   facade | 1.7 m walking strip | 1.1 m furniture | kerb | carriageway
+//
+// Narrowed from 4 m of footpath to 2.8. Four metres either side of an eight
+// metre carriageway is a boulevard, and at this camera height it read as a
+// plaza with a lane down the middle - the street wanted more road and less
+// pavement, which at a fixed cell size means moving the building line out
+// toward the kerb rather than making the tarmac wider.
+#define SIDEWALK_WIDTH   2.8f                              // kerb to facade
 #define LOT_LINE_SHIFT   (CITY_TILE - SIDEWALK_WIDTH)      // how far a facade moves streetward
-#define KERB_STRIP       1.5f                              // width of the furniture zone
+#define KERB_STRIP       1.1f                              // width of the furniture zone
 // both measured from a pavement cell's centre, positive toward the road
 #define KERB_INSET       (CITY_TILE * 0.5f - KERB_STRIP * 0.5f)
 #define WALK_INSET       ((CITY_TILE * 0.5f - SIDEWALK_WIDTH) \
@@ -88,10 +97,10 @@ static float dir_to_yaw_along(int dir);
 // in than the network can carry does not look busy, it looks jammed - every
 // junction saturates and the queues never clear.
 #define MAX_CARS         130
-// The footpath is a 2.5 m walking strip now, not a whole 8 m tile, so the same
+// The footpath is a 1.7 m walking strip now, not a whole 8 m tile, so the same
 // crowd that used to look busy on it packs it solid and everyone spends their
 // time shouldering past everyone else.
-#define MAX_PEDS         190
+#define MAX_PEDS         150
 #define CAR_SPAWN_RADIUS 210.0f  // cars are kept alive within this of the player
 #define PED_SPAWN_RADIUS 130.0f
 
@@ -119,22 +128,31 @@ static float dir_to_yaw_along(int dir);
 #define PLAYER_JUMP_SPEED   5.2f
 #define PLAYER_AIR_TIME     (2.0f * PLAYER_JUMP_SPEED / 22.0f)   // phys_world gravity is -22 m/s^2
 
-// Where a KayKit streetlight's head sits once the model is at KIT_PROP_SCALE,
-// measured off the mesh rather than guessed. The light source goes there, not
-// at the base of the post.
+// Fallback head height for a street lamp. The placement pass measures the real
+// one off whichever lamp model is loaded - head at the top of the post, arm
+// reach from its own depth - so this is only what anything else asking "how
+// high is a street light" should assume.
 #define LAMP_HEIGHT      4.4f
 #define LAMP_RADIUS     19.0f      // how far one lamp reaches down the street
 #define HEADLIGHT_RANGE 30.0f
 
 // Punctual lights fall off as inverse square, so their colour is an intensity
-// in candela-like units, not a 0..1 screen colour. At the 5 m from a lamp head
-// down to the pavement under it the falloff has already divided by 25, so a
-// colour near 1 arrives as nothing at all - which is exactly what a street of
-// lamps lighting none of the road looks like. These are the numbers that put
-// roughly a quarter of daylight on the ground directly beneath a lamp.
-#define LAMP_INTENSITY      260.0f
-#define HEADLIGHT_INTENSITY 420.0f
-#define BRAKE_INTENSITY      90.0f
+// in candela-like units, not a 0..1 screen colour: at the four metres from a
+// lamp head down to the pavement under it the falloff has already divided by
+// sixteen, and a colour near 1 arrives as nothing at all.
+//
+// These numbers are a full order of magnitude below what they were, and the
+// reason is that the old ones were never actually seen. The frame's light
+// selection ranked candela against metres, so every one of the thirty-two
+// slots went to headlights somewhere across the city and not one street lamp
+// was ever uploaded - the numbers here could be anything at all and the street
+// looked identical. With the selection fixed, 260 turned a night street into a
+// sheet of blown-out white. What these give instead is a bright pool directly
+// under each lamp, falling off to something you can still read a pavement by
+// about eight metres out, which is what a sodium street light does.
+#define LAMP_INTENSITY       24.0f
+#define HEADLIGHT_INTENSITY  70.0f
+#define BRAKE_INTENSITY      14.0f
 
 #define TRAFFIC_LIGHT_PERIOD 11.0f   // seconds per full north-south / east-west cycle
 // Fraction of each half cycle held all-red after a green ends. Without it the
@@ -195,13 +213,6 @@ static float dir_to_yaw(int dir) {
         default:     return 4.71238898f;   // DIR_PX
     }
 }
-
-// KayKit's building_A..H are the one exception in the whole art set: their
-// ground-floor detail (doors, awnings, the denser cluster of windows) sits on
-// +Z, not -Z - checked by counting low-y vertices per face across six of the
-// eight models, all lopsided the same way. Half a turn on top of dir_to_yaw
-// puts their actual front toward the street instead of their service side.
-static float dir_to_yaw_building(int dir) { return dir_to_yaw(dir) + 3.14159265f; }
 
 static vec3 dir_to_vec(int dir) { return v3((float)DIR_DX[dir], 0.0f, (float)DIR_DZ[dir]); }
 

@@ -1,0 +1,434 @@
+pix city asset report
+=====================
+
+models    221 / 650
+meshes    327 / 512      skinned 14 / 512
+vertices  822571 / 2097152      indices 1282368 / 2097152
+materials 496 / 768
+clips     306 / 512      arena 85.5 / 768.0 MB
+
+sets
+  road             6 models
+      road_straight                       8.00 x  0.40 x  8.00 m
+      road_corner                         8.00 x  0.40 x  8.00 m
+      road_tsplit                         8.00 x  0.40 x  8.00 m
+      road_junction                       8.00 x  0.40 x  8.00 m
+      road_straight_crossing              8.00 x  0.40 x  8.00 m
+      road_corner_curved                  8.00 x  0.40 x  8.00 m
+  building        40 models
+      building_A facade 0                 8.00 x  6.60 x  8.00 m
+      building_B facade 0                 8.00 x  6.60 x  8.00 m
+      building_C facade 0                 8.00 x 11.91 x  8.00 m
+      building_D facade 0                 8.00 x 11.88 x  8.08 m
+      building_E facade 0                 8.03 x  9.40 x  8.00 m
+      building_F facade 0                 8.03 x  9.40 x  8.00 m
+      building_G facade 0                 8.03 x 11.91 x  8.00 m
+      building_H facade 0                 8.03 x 12.20 x  8.00 m
+      building_A facade 1                 8.00 x  6.60 x  8.00 m
+      building_B facade 1                 8.00 x  6.60 x  8.00 m
+      building_C facade 1                 8.00 x 11.91 x  8.00 m
+      building_D facade 1                 8.00 x 11.88 x  8.08 m
+      building_E facade 1                 8.03 x  9.40 x  8.00 m
+      building_F facade 1                 8.03 x  9.40 x  8.00 m
+      building_G facade 1                 8.03 x 11.91 x  8.00 m
+      building_H facade 1                 8.03 x 12.20 x  8.00 m
+      building_A facade 2                 8.00 x  6.60 x  8.00 m
+      building_B facade 2                 8.00 x  6.60 x  8.00 m
+      building_C facade 2                 8.00 x 11.91 x  8.00 m
+      building_D facade 2                 8.00 x 11.88 x  8.08 m
+      building_E facade 2                 8.03 x  9.40 x  8.00 m
+      building_F facade 2                 8.03 x  9.40 x  8.00 m
+      building_G facade 2                 8.03 x 11.91 x  8.00 m
+      building_H facade 2                 8.03 x 12.20 x  8.00 m
+      building_A facade 3                 8.00 x  6.60 x  8.00 m
+      building_B facade 3                 8.00 x  6.60 x  8.00 m
+      building_C facade 3                 8.00 x 11.91 x  8.00 m
+      building_D facade 3                 8.00 x 11.88 x  8.08 m
+      building_E facade 3                 8.03 x  9.40 x  8.00 m
+      building_F facade 3                 8.03 x  9.40 x  8.00 m
+      building_G facade 3                 8.03 x 11.91 x  8.00 m
+      building_H facade 3                 8.03 x 12.20 x  8.00 m
+      building_A facade 4                 8.00 x  6.60 x  8.00 m
+      building_B facade 4                 8.00 x  6.60 x  8.00 m
+      building_C facade 4                 8.00 x 11.91 x  8.00 m
+      building_D facade 4                 8.00 x 11.88 x  8.08 m
+      building_E facade 4                 8.03 x  9.40 x  8.00 m
+      building_F facade 4                 8.03 x  9.40 x  8.00 m
+      building_G facade 4                 8.03 x 11.91 x  8.00 m
+      building_H facade 4                 8.03 x 12.20 x  8.00 m
+  house           26 models
+      building-type-a                     8.16 x  5.23 x  6.45 m
+      building-type-b                     8.16 x  5.08 x  5.09 m
+      building-type-c                     8.16 x  6.56 x  6.52 m
+      building-type-d                     8.16 x  5.75 x  4.78 m
+      building-type-e                     8.16 x  7.14 x  6.45 m
+      building-type-f                     8.16 x  6.50 x  8.03 m
+      building-type-g                     8.16 x  4.32 x  6.63 m
+      building-type-h                     8.16 x  4.63 x  5.75 m
+      building-type-i                     8.16 x  4.68 x  6.52 m
+      building-type-j                     8.16 x  6.18 x  5.46 m
+      building-type-k                     7.37 x  9.20 x  8.16 m
+      building-type-l                     8.16 x  8.28 x  8.05 m
+      building-type-m                     8.16 x  4.21 x  8.16 m
+      building-type-n                     8.16 x  5.20 x  6.30 m
+      building-type-o                     8.16 x  7.31 x  6.61 m
+      building-type-p                     8.16 x  6.04 x  6.51 m
+      building-type-q                     8.16 x  6.04 x  5.83 m
+      building-type-r                     8.16 x  9.06 x  8.10 m
+      building-type-s                     8.16 x  6.60 x  6.30 m
+      building-type-t                     7.62 x  6.71 x  8.16 m
+      building-type-u                     8.16 x  6.50 x  6.21 m
+      House                               8.16 x  6.55 x  6.91 m
+      House                               5.59 x  6.07 x  8.16 m
+      Town House                          8.16 x 10.15 x  5.97 m
+      Brown Building                      8.16 x 14.62 x  7.89 m
+      Building Red                        8.16 x 11.74 x  4.52 m
+  tower            4 models
+      Apartment building                  8.48 x 14.88 x  4.76 m
+      Big Building                        8.48 x 10.23 x  7.91 m
+      Building                            8.48 x 10.02 x  7.04 m
+      Bakery                              8.48 x  4.89 x  5.40 m
+  yard             4 models
+      Fence                               8.00 x  1.59 x  0.22 m
+      Fence                               3.00 x  2.35 x  0.19 m
+      Fence Piece                         2.00 x  1.40 x  0.51 m
+      Fence End                           1.50 x  0.87 x  0.32 m
+  paving           4 models
+      Path Straight                       1.72 x  0.16 x  3.40 m
+      Rock Path Round Small               1.07 x  0.11 x  1.50 m
+      Rock Path Round Wide                2.18 x  0.12 x  2.20 m
+      Rock Path Square Thin               2.51 x  0.28 x  3.20 m
+  street          24 models
+      streetlight                         1.08 x  3.84 x  0.28 m
+      trafficlight_A                      0.70 x  2.92 x  0.60 m
+      bench                               1.60 x  0.40 x  0.60 m
+      firehydrant                         0.54 x  0.90 x  0.53 m
+      trash_A                             0.51 x  0.21 x  0.53 m
+      dumpster                            2.26 x  1.27 x  1.41 m
+      trafficlight_B                      1.12 x  3.84 x  0.60 m
+      trafficlight_C                      3.19 x  3.88 x  1.09 m
+      trash_B                             0.27 x  0.16 x  0.28 m
+      box_A                               0.80 x  0.71 x  0.81 m
+      box_B                               0.61 x  0.68 x  0.62 m
+      Street Light                        0.25 x  4.50 x  1.98 m
+      Fire Hydrant                        0.50 x  0.75 x  0.39 m
+      Trash Can                           0.87 x  1.00 x  0.91 m
+      Dumpster                            1.80 x  1.50 x  0.96 m
+      Barrel                              0.55 x  0.90 x  0.55 m
+      Traffic Cone                        0.70 x  0.66 x  0.70 m
+      Traffic Barrier                     1.10 x  0.79 x  0.62 m
+      Stop sign                           0.08 x  2.20 x  0.72 m
+      Town Sign                           2.50 x  2.24 x  0.72 m
+      Sign                                1.10 x  2.00 x  1.01 m
+      Crate                               0.80 x  0.80 x  0.80 m
+      Cardboard Boxes                     0.90 x  0.47 x  0.67 m
+      Mailbox                             0.57 x  1.20 x  0.59 m
+  tree (street)    5 models
+      Birch Trees                         4.47 x  7.50 x  2.95 m
+      Birch Trees                         4.86 x  7.50 x  4.77 m
+      Birch Trees                         4.94 x  7.50 x  3.27 m
+      Birch Trees                         3.72 x  7.50 x  2.67 m
+      Birch Trees                         3.32 x  7.50 x  2.79 m
+  tree (park)     17 models
+      Pine                                3.91 x  8.00 x  4.32 m
+      Pine                                5.38 x  9.50 x  4.98 m
+      Maple Trees                         8.19 x  8.50 x  5.93 m
+      Maple Trees                         6.55 x  8.50 x  5.76 m
+      Maple Trees                         8.50 x  6.61 x  6.26 m
+      Maple Trees                         8.48 x  8.50 x  7.91 m
+      Maple Trees                         7.97 x  8.50 x  6.27 m
+      Dead Trees                          4.98 x  6.50 x  2.96 m
+      Dead Trees                          4.05 x  6.50 x  1.41 m
+      Dead Trees                          6.50 x  5.00 x  3.82 m
+      Dead Trees                          6.32 x  6.50 x  5.18 m
+      Dead Trees                          5.48 x  6.50 x  3.34 m
+      Trees                               4.72 x  8.00 x  3.20 m
+      Trees                               5.56 x  8.00 x  3.40 m
+      Trees                               7.63 x  8.00 x  4.36 m
+      Trees                               8.00 x  7.19 x  3.39 m
+      Trees                               8.00 x  7.70 x  6.63 m
+  shrub           17 models
+      Bush                                1.20 x  0.69 x  1.20 m
+      Bush with Flowers                   1.27 x  1.05 x  1.30 m
+      Flower Bushes                       0.95 x  0.94 x  1.00 m
+      Flower Bushes                       0.95 x  0.38 x  1.00 m
+      Flower Bushes                       0.97 x  0.77 x  1.00 m
+      Flower Group                        0.43 x  0.60 x  0.46 m
+      Flowers                             0.38 x  0.40 x  0.33 m
+      Flowers                             0.38 x  0.40 x  0.33 m
+      Flowers                             0.38 x  0.40 x  0.33 m
+      Flowers                             0.38 x  0.40 x  0.33 m
+      Flowers                             0.26 x  0.40 x  0.27 m
+      Flowers                             0.28 x  0.40 x  0.26 m
+      Flowers                             0.22 x  0.40 x  0.17 m
+      Grass                               0.50 x  0.34 x  0.33 m
+      Grass                               0.50 x  0.42 x  0.30 m
+      Grass Wispy                         0.60 x  0.49 x  0.55 m
+      Tall Grass                          0.38 x  0.80 x  0.42 m
+  rock             3 models
+      Rock                                0.89 x  0.81 x  1.00 m
+      Rock Medium                         1.67 x  1.13 x  1.70 m
+      Rock Medium                         1.90 x  1.18 x  1.54 m
+  park feature    12 models
+      statue_column                       1.20 x  4.00 x  1.20 m
+      statue_obelisk                      1.26 x  3.60 x  1.26 m
+      statue_ring                         2.11 x  2.80 x  1.41 m
+      statue_block                        1.60 x  1.60 x  1.60 m
+      pot_large                           1.40 x  0.50 x  1.21 m
+      pot_small                           1.00 x  0.83 x  0.87 m
+      campfire_stones                     1.50 x  0.22 x  1.43 m
+      sign                                1.32 x  1.80 x  0.31 m
+      path_stoneCircle                    2.60 x  0.14 x  2.44 m
+      tent_smallClosed                    2.07 x  2.12 x  2.40 m
+      canoe                               1.10 x  0.67 x  4.20 m
+      lily_large                          0.78 x  0.28 x  0.90 m
+  playground       4 models
+      Slide                               0.56 x  2.40 x  3.40 m
+      Swing set                           2.05 x  2.72 x  3.60 m
+      Jungle gym                          4.10 x  5.00 x  4.05 m
+      Seasaw                              0.70 x  0.81 x  2.60 m
+  wall             2 models
+      Stone Wall                          4.00 x  1.14 x  0.63 m
+      Fence                               4.00 x  2.20 x  0.50 m
+  waterfront       4 models
+      Dock Wide                           5.40 x  2.83 x  8.00 m
+      Dock                                2.06 x  1.83 x  4.80 m
+      Boat                                7.00 x  2.57 x  3.24 m
+      Boat                                6.00 x  3.60 x  2.65 m
+  landmark         6 models
+      Carpenter Gothic Church             8.56 x 17.00 x 15.84 m
+      Radio tower                         8.71 x 34.00 x  8.65 m
+      Radio tower                         7.15 x 30.00 x  8.10 m
+      Stag Statue                         2.29 x  4.60 x  1.26 m
+      Barn                               10.95 x 10.65 x 13.00 m
+      Big Barn                           11.28 x 11.51 x 12.00 m
+  industrial       4 models
+      Water Tower                         2.54 x  9.00 x  2.60 m
+      Container Green                     2.40 x  1.09 x  1.08 m
+      Container Red                       2.40 x  1.09 x  1.08 m
+      Stone Wall                          1.80 x  0.51 x  0.28 m
+  railroad         2 models
+      railroad-straight                   2.00 x  0.20 x  8.00 m
+      railroad-corner-large               8.00 x  0.18 x  8.00 m
+  train            8 models
+      train-locomotive-a                  4.07 x  4.72 x  7.40 m
+      train-carriage-box                  3.11 x  3.36 x  7.00 m
+      train-carriage-container-red        2.59 x  3.52 x  7.00 m
+      train-carriage-container-blue       2.59 x  3.52 x  7.00 m
+      train-carriage-tank                 3.59 x  4.54 x  7.00 m
+      train-carriage-lumber               2.85 x  3.01 x  7.00 m
+      train-carriage-flatbed              2.85 x  3.01 x  7.00 m
+      train-carriage-coal                 3.11 x  4.27 x  7.00 m
+
+named models that failed to load
+  (none)
+
+vehicles  8
+  0  4.3 x 2.0 m  1.3 m tall  lifted +0.03 m onto its wheels
+  1  4.4 x 1.9 m  1.4 m tall  lifted +0.01 m onto its wheels
+  2  4.5 x 2.1 m  1.5 m tall  lifted +0.02 m onto its wheels
+  3  4.6 x 2.3 m  1.7 m tall  lifted +0.02 m onto its wheels
+  4  4.8 x 1.9 m  2.2 m tall  lifted +0.98 m onto its wheels
+  5  4.2 x 2.0 m  1.3 m tall  lifted +0.07 m onto its wheels
+  6  5.3 x 2.4 m  1.9 m tall  lifted +0.01 m onto its wheels
+  7  6.5 x 3.4 m  3.6 m tall  lifted -0.00 m onto its wheels
+
+characters  13
+  rig 0   24 clips of its own, 2 borrowed, 0.98 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 1   24 clips of its own, 2 borrowed, 0.99 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 2   24 clips of its own, 2 borrowed, 0.99 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 3   11 clips of its own, 5 borrowed, 0.37 scale
+      idle   own
+      walk   own
+      run    own
+      jump   own
+      wave   own
+      talk   own
+      sit    own
+      punch  own
+      hit    borrowed
+      death  own
+      gunidle borrowed
+      gunaim borrowed
+      gunfire borrowed
+      gunrun borrowed
+  rig 4   10 clips of its own, 0 borrowed, 0.35 scale
+      idle   own
+      walk   own
+      run    own
+      jump   own
+      wave   own
+      talk   own
+      sit    own
+      punch  own
+      hit    MISSING
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 5   24 clips of its own, 2 borrowed, 1.00 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 6   24 clips of its own, 2 borrowed, 0.99 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 7   24 clips of its own, 2 borrowed, 0.99 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 8   11 clips of its own, 5 borrowed, 0.37 scale
+      idle   own
+      walk   own
+      run    own
+      jump   own
+      wave   own
+      talk   own
+      sit    own
+      punch  own
+      hit    borrowed
+      death  own
+      gunidle borrowed
+      gunaim borrowed
+      gunfire borrowed
+      gunrun borrowed
+  rig 9   11 clips of its own, 5 borrowed, 0.37 scale
+      idle   own
+      walk   own
+      run    own
+      jump   own
+      wave   own
+      talk   own
+      sit    own
+      punch  own
+      hit    borrowed
+      death  own
+      gunidle borrowed
+      gunaim borrowed
+      gunfire borrowed
+      gunrun borrowed
+  rig 10   11 clips of its own, 5 borrowed, 0.39 scale
+      idle   own
+      walk   own
+      run    own
+      jump   own
+      wave   own
+      talk   own
+      sit    own
+      punch  own
+      hit    borrowed
+      death  own
+      gunidle borrowed
+      gunaim borrowed
+      gunfire borrowed
+      gunrun borrowed
+  rig 11   24 clips of its own, 2 borrowed, 1.00 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+  rig 12   24 clips of its own, 2 borrowed, 0.98 scale
+      idle   own
+      walk   own
+      run    own
+      jump   borrowed
+      wave   own
+      talk   own
+      sit    borrowed
+      punch  own
+      hit    own
+      death  own
+      gunidle own
+      gunaim own
+      gunfire own
+      gunrun own
+
+animals  1
+  animal 0   idle yes  walk yes  run yes

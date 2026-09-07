@@ -31,7 +31,8 @@ struct framebuffer {
 
 // `hdr` picks RGBA16F over RGBA8, which is what lets a bloom or tonemap pass
 // work with values above 1 instead of clipping them at the source
-static framebuffer pix_create_render_target(int width, int height, bool hdr = true);
+static framebuffer pix_create_render_target(int width, int height, bool hdr = true,
+                                            bool mipmapped = false);
 static framebuffer pix_create_shadow_map(int width, int height);
 static void pix_destroy_framebuffer(framebuffer& target);
 
@@ -44,16 +45,25 @@ static void pix_draw_fullscreen(void);
 
 // ---------------- implementation ----------------
 
-static idx fb__make_color(int width, int height, bool hdr) {
+// `mipmapped` is for a target something else samples at a heavy, uneven
+// minification - the water's planar reflection, projected across a wide
+// range of distances and grazing angles in one draw. Mip selection there is
+// what turns a crisp, doubled copy of the scene (which reads as a sheet of
+// chrome, not water) into the softened, broken-up reflection a rippled
+// surface actually shows; a single full-res sample cannot do that on its
+// own no matter how the wave normal distorts its UV.
+static idx fb__make_color(int width, int height, bool hdr, bool mipmapped = false) {
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, hdr ? GL_RGBA16F : GL_RGBA8, width, height, 0,
                  GL_RGBA, hdr ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    mipmapped ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (mipmapped) glGenerateMipmap(GL_TEXTURE_2D);   // valid to call before any data too
     return tex;
 }
 
@@ -92,7 +102,7 @@ static bool fb__complete(const char* what) {
     return false;
 }
 
-static framebuffer pix_create_render_target(int width, int height, bool hdr) {
+static framebuffer pix_create_render_target(int width, int height, bool hdr, bool mipmapped) {
     framebuffer t = {};
     t.width = width;
     t.height = height;
@@ -101,7 +111,7 @@ static framebuffer pix_create_render_target(int width, int height, bool hdr) {
     glGenFramebuffers(1, &t.fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
 
-    t.color = fb__make_color(width, height, hdr);
+    t.color = fb__make_color(width, height, hdr, mipmapped);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.color, 0);
 
     t.depth = fb__make_depth(width, height, false);
